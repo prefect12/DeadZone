@@ -274,11 +274,10 @@ enum Store {
             let paths = shapes.map { $0.path(in: f) }
             let solid = zip(shapes, paths).filter { !(windowsCrossThin && $0.0.isThin(in: f)) }.map { $0.1 }
             let bounds = paths.reduce(CGRect.null) { $0.union($1.boundingBoxOfPath) }.intersection(f)
-            let area = rasterize(paths, frame: f).reduce(0) { $0 + $1.width * $1.height }
             let hasLine = shapes.contains { if case .stroke = $0 { return true } else { return false } }
             return DeadZone(screen: s, screenFrame: f, paths: paths, edges: paths.map(flatten),
                             rects: rasterize(solid, frame: f), bounds: bounds,
-                            damage: Double(area / (f.width * f.height)), shapeCount: shapes.count, hasLine: hasLine)
+                            damage: damageOf(shapes, frame: f), shapeCount: shapes.count, hasLine: hasLine)
         }
     }
 
@@ -965,13 +964,14 @@ final class Editor {
         let v = EditorView(frame: NSRect(origin: .zero, size: f.size), shapes: Store.shapes(for: screen))
         v.screenLabel = "\(screen.localizedName)（\(idx + 1)/\(screens.count)）"
         v.onFinish = { [weak self] s in
-            if let s { Store.set(s, for: screen) }
+            if let s { Store.set(s, for: screen); History.add(screen: screen, shapes: s) }
             self?.window?.orderOut(nil)
             self?.window = nil
             done()
         }
         v.onNextScreen = { [weak self] s in
             Store.set(s, for: screen)
+            History.add(screen: screen, shapes: s)
             let next = screens[(idx + 1) % screens.count]
             // 把鼠标带到下一块屏幕中央，方便直接开画
             let nf = toCG(next.frame)
@@ -1407,7 +1407,6 @@ struct StatsView: View {
             }
             .padding(22)
         }
-        .frame(width: 580, height: 680)
     }
 
     private func copyCard() {
@@ -1420,20 +1419,380 @@ struct StatsView: View {
     }
 }
 
-final class StatsWindow {
+// MARK: - 圈选记录
+
+struct HistoryRecord: Identifiable {
+    let id: String
+    let date: Date
+    let uuid: String            // 屏幕 UUID
+    let name: String
+    let aspect: CGFloat
+    let shapes: [Shape]
+    let damage: Double
+
+    var dict: [String: Any] {
+        ["id": id, "t": date.timeIntervalSince1970, "uuid": uuid, "name": name, "aspect": Double(aspect),
+         "shapes": shapes.map(\.dict), "damage": damage]
+    }
+
+    init(screen: NSScreen, shapes: [Shape]) {
+        id = UUID().uuidString
+        date = Date()
+        uuid = screen.uuid
+        name = screen.localizedName
+        aspect = screen.frame.width / max(screen.frame.height, 1)
+        self.shapes = shapes
+        damage = damageOf(shapes, frame: toCG(screen.frame))
+    }
+
+    init?(dict d: [String: Any]) {
+        guard let id = d["id"] as? String, let t = d["t"] as? Double, let uuid = d["uuid"] as? String,
+              let list = d["shapes"] as? [[String: Any]] else { return nil }
+        self.id = id
+        date = Date(timeIntervalSince1970: t)
+        self.uuid = uuid
+        name = d["name"] as? String ?? "未知屏幕"
+        aspect = CGFloat(d["aspect"] as? Double ?? 16.0 / 9)
+        shapes = list.compactMap(Shape.init(dict:))
+        damage = d["damage"] as? Double ?? 0
+    }
+}
+
+func sameShapes(_ a: [Shape], _ b: [Shape]) -> Bool { (a.map(\.dict) as NSArray).isEqual(to: b.map(\.dict)) }
+
+func damageOf(_ shapes: [Shape], frame f: CGRect) -> Double {
+    let area = rasterize(shapes.map { $0.path(in: f) }, frame: f).reduce(0) { $0 + $1.width * $1.height }
+    return Double(area / (f.width * f.height))
+}
+
+enum History {
+    static let key = "history"
+    static var d: UserDefaults { .standard }
+
+    static func all() -> [HistoryRecord] {
+        (d.array(forKey: key) as? [[String: Any]] ?? []).compactMap(HistoryRecord.init(dict:))
+    }
+
+    /// 保存一条记录（与该屏幕最近一条相同则跳过），最多保留 100 条
+    static func add(screen: NSScreen, shapes: [Shape]) {
+        var list = all()
+        if let last = list.first(where: { $0.uuid == screen.uuid }), sameShapes(last.shapes, shapes) { return }
+        list.insert(HistoryRecord(screen: screen, shapes: shapes), at: 0)
+        d.set(list.prefix(100).map(\.dict), forKey: key)
+    }
+
+    static func remove(_ id: String) {
+        d.set(all().filter { $0.id != id }.map(\.dict), forKey: key)
+    }
+}
+
+// MARK: - 主窗口数据
+
+final class AppModel: ObservableObject {
+    enum Tab: String, CaseIterable, Identifiable {
+        case screens = "屏幕", history = "圈选记录", achievements = "成就与战绩", settings = "设置"
+        var id: String { rawValue }
+        var icon: String {
+            switch self {
+            case .screens: return "display.2"
+            case .history: return "clock.arrow.circlepath"
+            case .achievements: return "trophy"
+            case .settings: return "gearshape"
+            }
+        }
+    }
+
+    struct ScreenInfo: Identifiable {
+        let id: String, name: String, size: CGSize, shapes: [Shape], damage: Double
+        var aspect: CGFloat { size.width / max(size.height, 1) }
+    }
+
+    @Published var tab: Tab = .screens
+    @Published var screens: [ScreenInfo] = []
+    @Published var history: [HistoryRecord] = []
+    @Published var report = Report(screens: [], days: 0, blocks: 0, moves: 0, unlocked: [:])
+    @Published var axTrusted = false
+    @Published var loginEnabled = false
+
+    @Published var showOverlay = true { didSet { persist("showOverlay", showOverlay) } }
+    @Published var avoidWindows = true { didSet { persist("avoidWindows", avoidWindows) } }
+    @Published var windowsCrossThin = false { didSet { persist("windowsCrossThin", windowsCrossThin) } }
+    @Published var blockMouse = true { didSet { persist("blockMouse", blockMouse) } }
+
+    var onEdit: (String) -> Void = { _ in }
+    var onClear: (String) -> Void = { _ in }
+    var onApply: (HistoryRecord) -> Void = { _ in }
+    var onSettingsChanged: () -> Void = {}
+    var onToggleLogin: () -> Void = {}
+    var onOpenAX: () -> Void = {}
+    var onClearAll: () -> Void = {}
+
+    private var loading = false
+    private func persist(_ k: String, _ v: Bool) {
+        guard !loading else { return }
+        Store.defaults.set(v, forKey: k)
+        onSettingsChanged()
+    }
+
+    func refresh(zones: [DeadZone]) {
+        loading = true
+        defer { loading = false }
+        screens = NSScreen.screens.map { s in
+            let shapes = Store.shapes(for: s)
+            return ScreenInfo(id: s.uuid, name: s.localizedName, size: s.frame.size, shapes: shapes,
+                              damage: zones.first { $0.screen.uuid == s.uuid }?.damage ?? 0)
+        }
+        history = History.all()
+        report = Report.current(zones)
+        axTrusted = AXIsProcessTrusted()
+        loginEnabled = SMAppService.mainApp.status == .enabled
+        showOverlay = Store.bool("showOverlay", default: true)
+        avoidWindows = Store.bool("avoidWindows", default: true)
+        windowsCrossThin = Store.bool("windowsCrossThin", default: false)
+        blockMouse = Store.bool("blockMouse", default: true)
+    }
+
+    func currentShapes(for uuid: String) -> [Shape]? { screens.first { $0.id == uuid }?.shapes }
+}
+
+// MARK: - 主窗口界面
+
+/// 屏幕缩略图：蓝色屏幕 + 黑色坏区
+struct ShapePreview: View {
+    let shapes: [Shape]
+    let aspect: CGFloat
+    var body: some View {
+        Canvas { ctx, size in
+            let r = CGRect(origin: .zero, size: size)
+            ctx.fill(Path(r), with: .linearGradient(Gradient(colors: [Color(red: 0.2, green: 0.62, blue: 0.75),
+                                                                       Color(red: 0.25, green: 0.4, blue: 0.85)]),
+                                                    startPoint: .zero, endPoint: CGPoint(x: size.width, y: size.height)))
+            for s in shapes {
+                let p = Path(s.path(in: r))
+                ctx.fill(p, with: .color(.black))
+                ctx.stroke(p, with: .color(.red.opacity(0.85)), lineWidth: 1)
+            }
+        }
+        .aspectRatio(aspect, contentMode: .fit)
+        .clipShape(RoundedRectangle(cornerRadius: 3))
+        .padding(5)
+        .background(Color.black, in: RoundedRectangle(cornerRadius: 7))
+    }
+}
+
+struct AXBanner: View {
+    @ObservedObject var model: AppModel
+    var body: some View {
+        if !model.axTrusted {
+            HStack(spacing: 10) {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("需要辅助功能权限").font(.headline)
+                    Text("没有这个权限就无法移动窗口和拦截鼠标").font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("去授权") { model.onOpenAX() }
+            }
+            .padding(12)
+            .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+        }
+    }
+}
+
+struct ScreensView: View {
+    @ObservedObject var model: AppModel
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                AXBanner(model: model)
+                ForEach(model.screens) { s in
+                    HStack(alignment: .center, spacing: 18) {
+                        ShapePreview(shapes: s.shapes, aspect: s.aspect).frame(width: 220)
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(s.name).font(.title3.bold())
+                            Text("\(Int(s.size.width)) × \(Int(s.size.height))").font(.caption).foregroundStyle(.secondary)
+                            if s.shapes.isEmpty {
+                                Text("还没有圈选坏区").foregroundStyle(.secondary)
+                            } else {
+                                let t = Tier.of(s.damage)
+                                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                    Text(pct(s.damage)).font(.system(size: 26, weight: .bold, design: .rounded)).monospacedDigit()
+                                    Text("\(t.emoji) \(t.name)").font(.headline)
+                                }
+                                Text("\(s.shapes.count) 块坏区").font(.caption).foregroundStyle(.secondary)
+                            }
+                            HStack {
+                                Button(s.shapes.isEmpty ? "圈选坏区" : "编辑坏区") { model.onEdit(s.id) }
+                                    .buttonStyle(.borderedProminent)
+                                if !s.shapes.isEmpty {
+                                    Button("清除") { model.onClear(s.id) }
+                                }
+                            }
+                            .padding(.top, 4)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .padding(16)
+                    .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 14))
+                }
+                Text("提示：编辑时按 Tab 可以保存并切换到下一块屏幕。每次保存都会自动存一条圈选记录。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .padding(22)
+        }
+    }
+}
+
+struct HistoryView: View {
+    @ObservedObject var model: AppModel
+    var body: some View {
+        if model.history.isEmpty {
+            VStack(spacing: 10) {
+                Image(systemName: "clock.arrow.circlepath").font(.system(size: 40)).foregroundStyle(.secondary)
+                Text("还没有圈选记录").font(.headline)
+                Text("每次在编辑界面保存，都会在这里留下一条记录，可以随时应用回去。")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ScrollView {
+                VStack(spacing: 10) {
+                    ForEach(model.history) { r in row(r) }
+                }
+                .padding(22)
+            }
+        }
+    }
+
+    @ViewBuilder private func row(_ r: HistoryRecord) -> some View {
+        let current = model.currentShapes(for: r.uuid)
+        let connected = current != nil
+        let isCurrent = current.map { sameShapes($0, r.shapes) } ?? false
+        HStack(spacing: 16) {
+            ShapePreview(shapes: r.shapes, aspect: r.aspect).frame(width: 130)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(r.date.formatted(date: .abbreviated, time: .shortened)).font(.headline)
+                    if isCurrent {
+                        Text("当前").font(.caption2.bold()).padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Color.green.opacity(0.2), in: Capsule())
+                    }
+                }
+                Text(r.name + (connected ? "" : "（未连接）")).font(.callout).foregroundStyle(.secondary)
+                Text(r.shapes.isEmpty ? "无坏区" : "\(r.shapes.count) 块坏区 · 损坏 \(pct(r.damage)) · \(Tier.of(r.damage).emoji) \(Tier.of(r.damage).name)")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("应用") { model.onApply(r) }
+                .disabled(!connected || isCurrent)
+                .help(connected ? "把这块屏幕的坏区恢复成这条记录" : "这块屏幕现在没有连接")
+            Button(role: .destructive) { History.remove(r.id); model.history = History.all() } label: {
+                Image(systemName: "trash")
+            }
+            .help("删除这条记录")
+        }
+        .padding(12)
+        .background(isCurrent ? Color.green.opacity(0.06) : Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+struct SettingsView: View {
+    @ObservedObject var model: AppModel
+    @State private var confirmClear = false
+
+    var body: some View {
+        Form {
+            Section {
+                AXBanner(model: model)
+                if model.axTrusted {
+                    Label("辅助功能权限已开启", systemImage: "checkmark.seal.fill").foregroundStyle(.green)
+                }
+            }
+            Section("坏区") {
+                Toggle(isOn: $model.showOverlay) {
+                    Text("黑色遮罩坏区"); Text("用纯黑盖住坏区，减少花屏干扰")
+                }
+                Toggle(isOn: $model.avoidWindows) {
+                    Text("自动把窗口移出坏区"); Text("窗口进入坏区后自动推开；最大化和全屏会避开坏区")
+                }
+                Toggle(isOn: $model.windowsCrossThin) {
+                    Text("允许窗口跨过细线坏区"); Text("宽度不超过 40pt 的坏线不再阻挡窗口，避免屏幕被一分为二")
+                }
+                .disabled(!model.avoidWindows)
+                Toggle(isOn: $model.blockMouse) {
+                    Text("阻止鼠标进入坏区"); Text("大块坏区贴边滑动，细线直接跳过")
+                }
+            }
+            Section("通用") {
+                Toggle("开机自动启动", isOn: Binding(get: { model.loginEnabled }, set: { _ in model.onToggleLogin() }))
+                Button("清除全部坏区…", role: .destructive) { confirmClear = true }
+            }
+            Section("关于") {
+                LabeledContent("版本", value: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "-")
+                Link("GitHub：prefect12/DeadZone", destination: URL(string: "https://github.com/prefect12/DeadZone")!)
+                Text("所有数据只保存在本机，不联网。").font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .confirmationDialog("清除所有屏幕上的坏区？", isPresented: $confirmClear) {
+            Button("清除", role: .destructive) { model.onClearAll() }
+        } message: {
+            Text("圈选记录会保留，之后可以从记录里恢复。")
+        }
+    }
+}
+
+struct MainView: View {
+    @ObservedObject var model: AppModel
+    var body: some View {
+        NavigationSplitView {
+            List(AppModel.Tab.allCases, selection: Binding(get: { model.tab }, set: { if let t = $0 { model.tab = t } })) { t in
+                Label(t.rawValue, systemImage: t.icon).tag(t)
+            }
+            .navigationSplitViewColumnWidth(170)
+        } detail: {
+            Group {
+                switch model.tab {
+                case .screens: ScreensView(model: model)
+                case .history: HistoryView(model: model)
+                case .achievements: StatsView(report: model.report)
+                case .settings: SettingsView(model: model)
+                }
+            }
+            .navigationTitle(model.tab.rawValue)
+        }
+        .frame(minWidth: 780, minHeight: 560)
+    }
+}
+
+final class MainWindow: NSObject, NSWindowDelegate {
     private var window: NSWindow?
 
-    func show(_ report: Report) {
-        let host = NSHostingView(rootView: StatsView(report: report))
-        let w = window ?? NSWindow(contentRect: NSRect(x: 0, y: 0, width: 580, height: 680),
-                                   styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
-        w.title = "成就与战绩"
-        w.isReleasedWhenClosed = false
-        w.contentView = host
-        if window == nil { w.center() }
-        window = w
+    func show(model: AppModel) {
+        if window == nil {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 860, height: 640),
+                             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                             backing: .buffered, defer: false)
+            w.title = "DeadZone"
+            w.isReleasedWhenClosed = false
+            w.contentView = NSHostingView(rootView: MainView(model: model))
+            w.delegate = self
+            w.center()
+            window = w
+        }
+        // 主窗口打开时在程序坞显示图标，关掉后回到纯菜单栏
+        NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
-        w.makeKeyAndOrderFront(nil)
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    func hide() { window?.orderOut(nil) }
+    var frameCG: CGRect? { window.map { toCG($0.frame) } }
+    func setFrameCG(_ r: CGRect) { window?.setFrame(toNS(r), display: true, animate: true) }
+    var isVisible: Bool { window?.isVisible ?? false }
+
+    func windowWillClose(_ n: Notification) {
+        NSApp.setActivationPolicy(.accessory)
     }
 }
 
@@ -1446,7 +1805,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let mouse = MouseGuard()
     private let editor = Editor()
     private let toaster = Toaster()
-    private let statsWindow = StatsWindow()
+    private let model = AppModel()
+    private let mainWindow = MainWindow()
     private var ticks = 0
     private var timer: Timer?
     private var editing = false
@@ -1456,11 +1816,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var avoidWindows: Bool { Store.bool("avoidWindows", default: true) }
     private var blockMouse: Bool { Store.bool("blockMouse", default: true) }
     private var windowsCrossThin: Bool { Store.bool("windowsCrossThin", default: false) }
-
-    private var defaultEditScreen: NSScreen? {
-        let m = NSEvent.mouseLocation
-        return NSScreen.screens.first { NSMouseInRect(m, $0.frame, false) } ?? NSScreen.main
-    }
 
     func applicationDidFinishLaunching(_ n: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -1490,13 +1845,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if self.ticks % 20 == 0 { self.updateStats() }       // 每 5 秒
         }
         toaster.zones = { [weak self] in self?.zones ?? [] }
+        model.onEdit = { [weak self] uuid in
+            if let s = NSScreen.screens.first(where: { $0.uuid == uuid }) { self?.startEditing(s) }
+        }
+        model.onClear = { [weak self] uuid in
+            guard let s = NSScreen.screens.first(where: { $0.uuid == uuid }) else { return }
+            Store.set([], for: s); History.add(screen: s, shapes: []); self?.reload()
+        }
+        model.onApply = { [weak self] r in
+            guard let s = NSScreen.screens.first(where: { $0.uuid == r.uuid }) else { return }
+            Store.set(r.shapes, for: s); self?.reload(); self?.updateStats()
+        }
+        model.onSettingsChanged = { [weak self] in self?.reload() }
+        model.onToggleLogin = { [weak self] in self?.toggleLogin() }
+        model.onOpenAX = { [weak self] in self?.openAXSettings() }
+        model.onClearAll = { [weak self] in self?.clearAll() }
+
+        // 已有坏区存成第一条圈选记录（与最近一条相同时会自动跳过）
+        for scr in NSScreen.screens where !Store.shapes(for: scr).isEmpty { History.add(screen: scr, shapes: Store.shapes(for: scr)) }
         reload()
-        if zones.isEmpty, let s = defaultEditScreen { startEditing(s) }
+        showMain(zones.isEmpty ? .screens : nil)
+    }
+
+    /// 打开主窗口（可指定页面）
+    private func showMain(_ tab: AppModel.Tab?) {
+        if let tab { model.tab = tab }
+        model.refresh(zones: zones)
+        mainWindow.show(model: model)
+        // 自己的窗口也要避开坏区
+        if let w = mainWindow.frameCG, let z = zones.first(where: { $0.screenFrame.intersects(w) }),
+           z.rects.contains(where: { overlaps($0, w) }),
+           let target = avoider.plan(w, dead: z.rects, screen: z.visibleFrame) ?? avoider.maxRect(dead: z.rects, screen: z.visibleFrame) {
+            mainWindow.setFrameCG(target)
+        }
     }
 
     /// 再次打开 App（例如在访达里双击）时进入编辑，防止菜单栏图标被刘海挤掉后无从下手
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !editing, let s = defaultEditScreen { startEditing(s) }
+        if !editing { showMain(nil) }
         return false
     }
 
@@ -1507,6 +1893,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard !zones.isEmpty, !editing else { return }
         Stats.markToday()
         toaster.show(Stats.unlockNew(Stats.metrics(zones)))
+        if mainWindow.isVisible { model.refresh(zones: zones) }
     }
 
     private func tickWindows() {
@@ -1520,6 +1907,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         mouse.update(zones: zones, screens: NSScreen.screens.map { toCG($0.frame) })
         if blockMouse && !editing && !zones.isEmpty { mouse.start() } else { mouse.stop() }
         statusItem.button?.appearsDisabled = zones.isEmpty
+        model.refresh(zones: zones)
     }
 
     private func startEditing(_ s: NSScreen) {
@@ -1541,6 +1929,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
+        menu.addItem(item("打开 DeadZone…", #selector(openMain), key: ","))
+        menu.addItem(.separator())
 
         let names = zones.map { "\($0.screen.localizedName)（\(Store.shapes(for: $0.screen).count) 块）" }
         menu.addItem(disabled(names.isEmpty ? "还没有设置坏区" : "已屏蔽：" + names.joined(separator: "、")))
@@ -1592,8 +1982,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     @objc func showStats() {
         updateStats()
-        statsWindow.show(Report.current(zones))
+        showMain(.achievements)
     }
+    @objc func openMain() { showMain(nil) }
     @objc func clearAll() { Store.clearAll(); reload() }
     @objc func toggleSetting(_ sender: NSMenuItem) {
         guard let k = sender.representedObject as? String else { return }
