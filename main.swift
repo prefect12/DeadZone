@@ -21,6 +21,22 @@ func overlaps(_ a: CGRect, _ b: CGRect) -> Bool {
 
 func dist(_ a: CGPoint, _ b: CGPoint) -> CGFloat { hypot(a.x - b.x, a.y - b.y) }
 
+// MARK: - 语言（跟随系统 / 中文 / English）
+
+enum Lang {
+    static var setting: String { UserDefaults.standard.string(forKey: "language") ?? "system" }
+    static var isEnglish: Bool {
+        switch setting {
+        case "en": return true
+        case "zh": return false
+        default: return !(Locale.preferredLanguages.first ?? "en").hasPrefix("zh")
+        }
+    }
+}
+
+/// 界面文字：L("中文", "English")
+func L(_ zh: String, _ en: String) -> String { Lang.isEnglish ? en : zh }
+
 extension NSScreen {
     var displayID: CGDirectDisplayID {
         (deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
@@ -677,8 +693,16 @@ private func mouseTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: 
 // 屏幕上有一个浮动工具栏：切换工具、调线宽、撤销/清空、保存，并实时提示下一步该做什么。
 
 enum EditorTool: String, CaseIterable, Identifiable {
-    case split = "分割", polygon = "多边形", rect = "矩形", line = "线条"
+    case split, polygon, rect, line
     var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .split: return L("分割", "Split")
+        case .polygon: return L("多边形", "Polygon")
+        case .rect: return L("矩形", "Rectangle")
+        case .line: return L("线条", "Line")
+        }
+    }
     var icon: String {
         switch self {
         case .split: return "square.split.diagonal"
@@ -687,6 +711,25 @@ enum EditorTool: String, CaseIterable, Identifiable {
         case .line: return "line.diagonal"
         }
     }
+    /// 引导卡片：什么样的坏法用这个工具
+    var situation: String {
+        switch self {
+        case .split: return L("角落或一整边黑了", "A corner or a whole side is dark")
+        case .line: return L("中间有一条竖线 / 横线 / 裂纹", "A vertical / horizontal line or a crack")
+        case .polygon: return L("中间有一块不规则的斑", "An irregular blotch in the middle")
+        case .rect: return L("一块规整的矩形", "A neat rectangular area")
+        }
+    }
+    var advice: String {
+        switch self {
+        case .split: return L("如左上角、右下角、半边屏：沿黑区边界画一条线，再选黑的那一边", "e.g. top-left, bottom-right, half the screen: draw a line along the edge, then pick the dark side")
+        case .line: return L("在线的两端各点一下；端点点在屏幕边缘，线就会贯穿整屏", "Click both ends of the line; ends on the screen edge make it span the screen")
+        case .polygon: return L("沿斑的边缘点一圈，把它围起来", "Click around its edge to enclose it")
+        case .rect: return L("按住鼠标，直接拖出一个矩形", "Just drag out a rectangle")
+        }
+    }
+    static let guideOrder: [EditorTool] = [.split, .line, .polygon, .rect]
+
     var key: String {
         switch self {
         case .split: return "1"
@@ -697,10 +740,10 @@ enum EditorTool: String, CaseIterable, Identifiable {
     }
     var usage: String {
         switch self {
-        case .split: return "一边全黑看不清：画分界线，选一边"
-        case .polygon: return "任意形状的斑块、角落"
-        case .rect: return "规整的矩形区域"
-        case .line: return "竖线、横线、裂纹"
+        case .split: return L("一边全黑看不清：画分界线，选一边", "One side is black: draw a dividing line, pick a side")
+        case .polygon: return L("任意形状的斑块、角落", "Blobs and corners of any shape")
+        case .rect: return L("规整的矩形区域", "Rectangular areas")
+        case .line: return L("竖线、横线、裂纹", "Dead lines and cracks")
         }
     }
 }
@@ -717,32 +760,34 @@ final class EditorState: ObservableObject {
     @Published var canUndo = false
     @Published var screenLabel = ""
     @Published var multiScreen = false
+    @Published var showGuide = true             // 开场引导：先问是哪种坏法
 
     var drawing: Bool { points > 0 || dragging || !splitLabels.isEmpty }
 
     var step: (icon: String, text: String) {
         switch tool {
         case .split:
-            if !splitLabels.isEmpty { return ("4.circle.fill", "选择哪一边是坏区：点下面的按钮（鼠标移上去可以预览），或直接点击那一边") }
-            if points == 0 { return ("1.circle.fill", "沿着黑区的边界画一条分界线：先在线的一端单击（不用点到屏幕边缘，会自动延伸过去）") }
-            if points < 2 { return ("2.circle.fill", "继续沿边界单击，或按住拖动描出分界线") }
-            return ("3.circle.fill", "双击 或 按回车，完成分界线 · 已放 \(points) 个点")
+            if !splitLabels.isEmpty { return ("4.circle.fill", L("选择哪一边是坏区：点下面的按钮（鼠标移上去可以预览），或直接点击那一边", "Pick the dead side: click a button below (hover to preview), or click that side directly")) }
+            if points == 0 { return ("1.circle.fill", L("沿着黑区的边界画一条分界线：先在线的一端单击（不用点到屏幕边缘，会自动延伸过去）", "Draw a line along the edge of the black area: click one end first (no need to reach the screen edge, it extends automatically)")) }
+            if points < 2 { return ("2.circle.fill", L("继续沿边界单击，或按住拖动描出分界线", "Keep clicking along the edge, or drag to trace the line")) }
+            return ("3.circle.fill", L("双击 或 按回车，完成分界线 · 已放 \(points) 个点", "Double-click or press Return to finish the line · \(points) points"))
         case .polygon:
-            if points == 0 { return ("1.circle.fill", "在坏区边缘单击，放下第一个点（在看得见的一侧；也可以按住拖动描边）") }
-            if points < 3 { return ("2.circle.fill", "继续沿边缘单击，把坏区围起来 · 已放 \(points) 个点，至少要 3 个") }
-            return ("3.circle.fill", "双击 或 按回车，完成这一块 · 已放 \(points) 个点")
+            if points == 0 { return ("1.circle.fill", L("在坏区边缘单击，放下第一个点（在看得见的一侧；也可以按住拖动描边）", "Click on the edge of the dead area to place the first point (from the visible side; you can also drag to trace)")) }
+            if points < 3 { return ("2.circle.fill", L("继续沿边缘单击，把坏区围起来 · 已放 \(points) 个点，至少要 3 个", "Keep clicking along the edge to enclose it · \(points) points, at least 3 needed")) }
+            return ("3.circle.fill", L("双击 或 按回车，完成这一块 · 已放 \(points) 个点", "Double-click or press Return to finish this area · \(points) points"))
         case .rect:
-            return dragging ? ("2.circle.fill", "松开鼠标完成这一块") : ("1.circle.fill", "按住鼠标，拖出一个盖住坏区的矩形")
+            return dragging ? ("2.circle.fill", L("松开鼠标完成这一块", "Release to finish this area")) : ("1.circle.fill", L("按住鼠标，拖出一个盖住坏区的矩形", "Drag out a rectangle that covers the dead area"))
         case .line:
-            if points == 0 { return ("1.circle.fill", "在坏线的一端单击（点在屏幕边缘，线就会贯穿整块屏幕）") }
-            if points < 2 { return ("2.circle.fill", "在坏线的另一端单击") }
-            return ("3.circle.fill", "双击 或 按回车，完成这条线 · 可以继续点击画折线")
+            if points == 0 { return ("1.circle.fill", L("在坏线的一端单击（点在屏幕边缘，线就会贯穿整块屏幕）", "Click one end of the dead line (click on the screen edge to span the whole screen)")) }
+            if points < 2 { return ("2.circle.fill", L("在坏线的另一端单击", "Click the other end of the dead line")) }
+            return ("3.circle.fill", L("双击 或 按回车，完成这条线 · 可以继续点击画折线", "Double-click or press Return to finish · keep clicking for a polyline"))
         }
     }
 
     // 工具栏上的操作，由 EditorView 实现
     var setTool: (EditorTool) -> Void = { _ in }
     var chooseSide: (Int) -> Void = { _ in }
+    var toggleGuide: (Bool) -> Void = { _ in }
     var hoverChanged: () -> Void = {}
     var undo: () -> Void = {}
     var clear: () -> Void = {}
@@ -759,81 +804,90 @@ struct EditorToolbar: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Label("圈选坏区 · \(s.screenLabel)", systemImage: "display").font(.headline)
+                Label(L("圈选坏区", "Mark Dead Zones") + " · \(s.screenLabel)", systemImage: "display").font(.headline)
                 Spacer()
+                if !s.showGuide {
+                    Button { s.toggleGuide(true) } label: { Label(L("选哪个工具？", "Which tool?"), systemImage: "questionmark.circle") }
+                }
                 if s.multiScreen {
-                    Button { s.nextScreen() } label: { Label("下一块屏幕", systemImage: "arrow.right.to.line") }
-                        .help("保存当前屏幕，切换到下一块（Tab）")
+                    Button { s.nextScreen() } label: { Label(L("下一块屏幕", "Next Screen"), systemImage: "arrow.right.to.line") }
+                        .help(L("保存当前屏幕，切换到下一块（Tab）", "Save this screen and switch to the next one (Tab)"))
                 }
             }
 
-            HStack(spacing: 8) {
-                ForEach(EditorTool.allCases) { t in
-                    Button { s.setTool(t) } label: {
-                        VStack(spacing: 3) {
-                            Image(systemName: t.icon).font(.system(size: 18))
-                            Text(t.rawValue).font(.caption.bold())
+            if s.showGuide {
+                ToolGuide(s: s)
+            } else {
+                VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 8) {
+                    ForEach(EditorTool.allCases) { t in
+                        Button { s.setTool(t) } label: {
+                            VStack(spacing: 3) {
+                                Image(systemName: t.icon).font(.system(size: 18))
+                                Text(t.title).font(.caption.bold())
+                            }
+                            .frame(width: 64, height: 46)
+                            .background(s.tool == t ? Color.accentColor : Color.primary.opacity(0.08),
+                                        in: RoundedRectangle(cornerRadius: 9))
+                            .foregroundStyle(s.tool == t ? Color.white : Color.primary)
                         }
-                        .frame(width: 64, height: 46)
-                        .background(s.tool == t ? Color.accentColor : Color.primary.opacity(0.08),
-                                    in: RoundedRectangle(cornerRadius: 9))
-                        .foregroundStyle(s.tool == t ? Color.white : Color.primary)
+                        .buttonStyle(.plain)
+                        .help("\(t.title): \(t.usage) (\(t.key))")
                     }
-                    .buttonStyle(.plain)
-                    .help("\(t.rawValue)：\(t.usage)（快捷键 \(t.key)）")
-                }
-                if s.tool == .line {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("线宽 \(Int(s.lineWidth)) pt").font(.caption).monospacedDigit()
-                        Slider(value: Binding(get: { Double(s.lineWidth) },
-                                              set: { s.lineWidth = CGFloat($0); s.widthChanged() }), in: 2...120)
-                            .frame(width: 130)
-                    }
-                    .padding(.leading, 6)
-                } else {
-                    Text(s.tool.usage).font(.caption).foregroundStyle(.secondary).padding(.leading, 6)
-                }
-                Spacer(minLength: 8)
-                Button { s.undo() } label: { Image(systemName: "arrow.uturn.backward") }
-                    .disabled(!s.canUndo && !s.drawing).help("撤销（⌘Z）")
-                Button { s.clear() } label: { Image(systemName: "trash") }
-                    .disabled(s.shapeCount == 0 && !s.drawing).help("清空这块屏幕的全部坏区")
-            }
-
-            if !s.splitLabels.isEmpty {
-                HStack(spacing: 10) {
-                    ForEach(Array(s.splitLabels.enumerated()), id: \.offset) { i, label in
-                        Button { s.chooseSide(i) } label: {
-                            Text("把「\(label)」设为坏区").font(.system(size: 14, weight: .semibold))
-                                .frame(maxWidth: .infinity).padding(.vertical, 6)
+                    if s.tool == .line {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(L("线宽", "Width") + " \(Int(s.lineWidth)) pt").font(.caption).monospacedDigit()
+                            Slider(value: Binding(get: { Double(s.lineWidth) },
+                                                  set: { s.lineWidth = CGFloat($0); s.widthChanged() }), in: 2...120)
+                                .frame(width: 130)
                         }
-                        .buttonStyle(.borderedProminent)
-                        .tint(s.hoverSide == i ? .red : .gray)
-                        .onHover { h in
-                            if h { s.hoverSide = i } else if s.hoverSide == i { s.hoverSide = nil }
-                            s.hoverChanged()
+                        .padding(.leading, 6)
+                    } else {
+                        Text(s.tool.usage).font(.caption).foregroundStyle(.secondary).padding(.leading, 6)
+                    }
+                    Spacer(minLength: 8)
+                    Button { s.undo() } label: { Image(systemName: "arrow.uturn.backward") }
+                        .disabled(!s.canUndo && !s.drawing).help(L("撤销（⌘Z）", "Undo (⌘Z)"))
+                    Button { s.clear() } label: { Image(systemName: "trash") }
+                        .disabled(s.shapeCount == 0 && !s.drawing).help(L("清空这块屏幕的全部坏区", "Clear all dead zones on this screen"))
+                }
+
+                if !s.splitLabels.isEmpty {
+                    HStack(spacing: 10) {
+                        ForEach(Array(s.splitLabels.enumerated()), id: \.offset) { i, label in
+                            Button { s.chooseSide(i) } label: {
+                                Text(L("把「\(label)」设为坏区", "Mark \(label) as dead")).font(.system(size: 14, weight: .semibold))
+                                    .frame(maxWidth: .infinity).padding(.vertical, 6)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(s.hoverSide == i ? .red : .gray)
+                            .onHover { h in
+                                if h { s.hoverSide = i } else if s.hoverSide == i { s.hoverSide = nil }
+                                s.hoverChanged()
+                            }
                         }
                     }
                 }
-            }
 
-            HStack(alignment: .top, spacing: 8) {
-                Image(systemName: s.step.icon).font(.system(size: 18)).foregroundStyle(Color.yellow)
-                Text(s.step.text).font(.system(size: 14, weight: .medium)).fixedSize(horizontal: false, vertical: true)
-            }
-            .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.yellow.opacity(0.12), in: RoundedRectangle(cornerRadius: 9))
-
-            HStack {
-                Text(s.shapeCount == 0 ? "还没有圈选" : "已圈选 \(s.shapeCount) 块 · 右键点红色区域可删除")
-                    .font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                Button("取消") { s.cancel() }.keyboardShortcut(.cancelAction)
-                if s.drawing && s.tool != .rect && s.splitLabels.isEmpty {
-                    Button(s.tool == .split ? "完成分界线" : "完成这一块") { s.finishShape() }
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: s.step.icon).font(.system(size: 18)).foregroundStyle(Color.yellow)
+                    Text(s.step.text).font(.system(size: 14, weight: .medium)).fixedSize(horizontal: false, vertical: true)
                 }
-                Button("保存并退出") { s.save() }.buttonStyle(.borderedProminent)
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.yellow.opacity(0.12), in: RoundedRectangle(cornerRadius: 9))
+
+                HStack {
+                    Text(s.shapeCount == 0 ? L("还没有圈选", "Nothing marked yet") : L("已圈选 \(s.shapeCount) 块 · 右键点红色区域可删除", "\(s.shapeCount) marked · right-click a red area to delete it"))
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button(L("取消", "Cancel")) { s.cancel() }.keyboardShortcut(.cancelAction)
+                    if s.drawing && s.tool != .rect && s.splitLabels.isEmpty {
+                        Button(s.tool == .split ? L("完成分界线", "Finish Line") : L("完成这一块", "Finish Area")) { s.finishShape() }
+                    }
+                    Button(L("保存并退出", "Save & Exit")) { s.save() }.buttonStyle(.borderedProminent)
+                }
+                }
             }
         }
         .padding(16)
@@ -841,6 +895,88 @@ struct EditorToolbar: View {
         .background(Color(white: 0.11).opacity(0.97), in: RoundedRectangle(cornerRadius: 16))
         .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(Color.white.opacity(0.15)))
         .environment(\.colorScheme, .dark)
+    }
+}
+
+/// 开场引导里的示意小图
+struct GuideSketch: View {
+    let tool: EditorTool
+    var body: some View {
+        Canvas { ctx, size in
+            let W = size.width, H = size.height
+            ctx.fill(Path(CGRect(origin: .zero, size: size)), with: .color(Color(red: 0.23, green: 0.45, blue: 0.75)))
+            let yellow = GraphicsContext.Shading.color(.yellow)
+            func dot(_ p: CGPoint) { ctx.fill(Path(ellipseIn: CGRect(x: p.x - 2.5, y: p.y - 2.5, width: 5, height: 5)), with: yellow) }
+            switch tool {
+            case .split:
+                let a = CGPoint(x: W * 0.42, y: 0), b = CGPoint(x: W, y: H * 0.62), c = CGPoint(x: W * 0.6, y: H * 0.5)
+                var p = Path(); p.move(to: a); p.addQuadCurve(to: b, control: c); p.addLine(to: CGPoint(x: W, y: 0)); p.closeSubpath()
+                ctx.fill(p, with: .color(.black))
+                var l = Path(); l.move(to: a); l.addQuadCurve(to: b, control: c)
+                ctx.stroke(l, with: yellow, style: StrokeStyle(lineWidth: 2, dash: [4, 2]))
+            case .line:
+                let x = W * 0.56
+                ctx.fill(Path(CGRect(x: x - 1.5, y: 0, width: 3, height: H)), with: .color(.black))
+                dot(CGPoint(x: x, y: 3)); dot(CGPoint(x: x, y: H - 3))
+            case .polygon:
+                let c = CGPoint(x: W * 0.55, y: H * 0.5)
+                let pts = [0.0, 0.9, 1.7, 2.6, 3.5, 4.4, 5.3].enumerated().map { i, a -> CGPoint in
+                    let r = [0.30, 0.22, 0.34, 0.26, 0.32, 0.2, 0.28][i]
+                    return CGPoint(x: c.x + cos(a) * W * r * 0.8, y: c.y + sin(a) * H * r * 1.1)
+                }
+                var p = Path(); p.addLines(pts); p.closeSubpath()
+                ctx.fill(p, with: .color(.black))
+                ctx.stroke(p, with: yellow, lineWidth: 1)
+                pts.forEach(dot)
+            case .rect:
+                let r = CGRect(x: W * 0.14, y: H * 0.5, width: W * 0.42, height: H * 0.34)
+                ctx.fill(Path(r), with: .color(.black))
+                ctx.stroke(Path(r), with: yellow, lineWidth: 1.5)
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 5))
+        .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(Color.black, lineWidth: 2))
+    }
+}
+
+/// 开场引导：你的屏幕是哪种坏法？
+struct ToolGuide: View {
+    @ObservedObject var s: EditorState
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(L("你的屏幕是哪种坏法？选一个最像的", "What does the damage look like? Pick the closest match"))
+                .font(.system(size: 15, weight: .semibold))
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
+                ForEach(EditorTool.guideOrder) { t in card(t) }
+            }
+            HStack {
+                Text(L("之后可以随时切换工具，多种工具也能叠加使用", "You can switch tools any time and combine them"))
+                    .font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button(L("取消", "Cancel")) { s.cancel() }
+            }
+        }
+    }
+
+    private func card(_ t: EditorTool) -> some View {
+        Button { s.setTool(t) } label: {
+            HStack(alignment: .top, spacing: 12) {
+                GuideSketch(tool: t).frame(width: 92, height: 54)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(t.situation).font(.system(size: 13, weight: .semibold))
+                    Text(t.advice).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    Label("\(t.title) · \(t.key)", systemImage: t.icon).font(.caption2.bold())
+                        .padding(.horizontal, 7).padding(.vertical, 3)
+                        .background(Color.accentColor.opacity(0.35), in: Capsule())
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, minHeight: 104, alignment: .topLeading)
+            .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 10))
+            .contentShape(RoundedRectangle(cornerRadius: 10))
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -868,6 +1004,10 @@ final class EditorView: NSView {
         super.init(frame: frame)
         state.setTool = { [weak self] t in self?.setTool(t) }
         state.chooseSide = { [weak self] i in self?.choose(i) }
+        state.toggleGuide = { [weak self] on in
+            self?.state.showGuide = on
+            self?.relayout()
+        }
         state.hoverChanged = { [weak self] in self?.needsDisplay = true }
         state.undo = { [weak self] in self?.undo() }
         state.clear = { [weak self] in self?.clearAll() }
@@ -965,7 +1105,15 @@ final class EditorView: NSView {
         sync(); refocus()
     }
 
+    /// 工具栏内容变化后，等 SwiftUI 算好尺寸再重新摆放
+    private func relayout() {
+        sync()
+        DispatchQueue.main.async { [weak self] in self?.sync() }
+        refocus()
+    }
+
     private func setTool(_ t: EditorTool) {
+        if state.showGuide { state.showGuide = false; relayout() }
         clearSplit()
         if !pts.isEmpty { finish() }
         state.tool = t
@@ -1085,13 +1233,15 @@ final class EditorView: NSView {
         }
         let c = abs(a) > 0.01 ? CGPoint(x: cx / (3 * a), y: cy / (3 * a)) : p[0]
         let dx = (c.x - W / 2) / W, dy = (c.y - H / 2) / H
-        let h = dx < -0.03 ? "左" : dx > 0.03 ? "右" : ""
-        let v = dy < -0.03 ? "上" : dy > 0.03 ? "下" : ""
+        let en = Lang.isEnglish
+        let h = dx < -0.03 ? (en ? "left" : "左") : dx > 0.03 ? (en ? "right" : "右") : ""
+        let v = dy < -0.03 ? (en ? "top" : "上") : dy > 0.03 ? (en ? "bottom" : "下") : ""
         let name: String
         switch (h.isEmpty, v.isEmpty) {
-        case (true, true): name = "中间"
-        case (false, true): name = h + "侧"
-        default: name = h + v + "方"
+        case (true, true): name = L("中间", "middle")
+        case (false, true): name = en ? h + " side" : h + "侧"
+        case (true, false): name = en ? v : v + "方"
+        default: name = en ? "\(v)-\(h)" : h + v + "方"
         }
         return "\(name) · \(pct(Double(polyArea(p) / (W * H))))"
     }
@@ -1234,7 +1384,7 @@ final class EditorView: NSView {
                 c.fillPath()
                 // 在这一边的中间写上名字
                 let r = p.boundingBoxOfPath
-                let label = (hot ? "设为坏区：" : "") + sideNames[i]
+                let label = (hot ? L("设为坏区：", "Mark as dead: ") : "") + sideNames[i]
                 let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 22, weight: .bold),
                                                             .foregroundColor: NSColor.white.withAlphaComponent(hot ? 1 : 0.7)]
                 var at = CGPoint(x: r.midX, y: r.midY)
@@ -1385,15 +1535,15 @@ func makeStatusIcon() -> NSImage {
 struct Tier {
     let min: Double, emoji: String, name: String, comment: String
 
-    static let all: [Tier] = [
-        Tier(min: 0.00, emoji: "🔍", name: "坏点而已", comment: "这点坏，不仔细看都发现不了"),
-        Tier(min: 0.05, emoji: "💧", name: "洒洒水啦", comment: "小场面，照用不误"),
-        Tier(min: 0.15, emoji: "🩹", name: "小伤不下火线", comment: "轻伤不下火线，屏幕也一样"),
-        Tier(min: 0.30, emoji: "💪", name: "身残志坚", comment: "残缺的屏幕，完整的生产力"),
-        Tier(min: 0.50, emoji: "🏯", name: "半壁江山", comment: "坏了一半，还剩一半"),
-        Tier(min: 0.70, emoji: "🧮", name: "勤俭持家小能手", comment: "能用就不换，你是懂过日子的"),
-        Tier(min: 0.90, emoji: "🪦", name: "这就别用了吧", comment: "求求了，换一块吧"),
-    ]
+    static var all: [Tier] { [
+        Tier(min: 0.00, emoji: "🔍", name: L("坏点而已", "Just a Dead Pixel"), comment: L("这点坏，不仔细看都发现不了", "You can barely tell it's broken")),
+        Tier(min: 0.05, emoji: "💧", name: L("洒洒水啦", "No Biggie"), comment: L("小场面，照用不误", "Small stuff, carry on")),
+        Tier(min: 0.15, emoji: "🩹", name: L("小伤不下火线", "Just a Flesh Wound"), comment: L("轻伤不下火线，屏幕也一样", "A scratch won't take you off the front line")),
+        Tier(min: 0.30, emoji: "💪", name: L("身残志坚", "Broken but Unbowed"), comment: L("残缺的屏幕，完整的生产力", "Incomplete screen, complete productivity")),
+        Tier(min: 0.50, emoji: "🏯", name: L("半壁江山", "Half an Empire"), comment: L("坏了一半，还剩一半", "Half gone, half still yours")),
+        Tier(min: 0.70, emoji: "🧮", name: L("勤俭持家小能手", "Master of Thrift"), comment: L("能用就不换，你是懂过日子的", "If it still works, why replace it?")),
+        Tier(min: 0.90, emoji: "🪦", name: L("这就别用了吧", "Please, Just Replace It"), comment: L("求求了，换一块吧", "We're begging you. Get a new one.")),
+    ] }
 
     static func of(_ damage: Double) -> Tier { all.last { damage >= $0.min } ?? all[0] }
 }
@@ -1433,12 +1583,13 @@ enum Ranking {
 
     static func beat(_ d: Double) -> String {
         let p = percentile(d)
-        return "超过全球约 " + (p >= 0.999 ? String(format: "%.2f%%", p * 100) : String(format: "%.1f%%", p * 100)) + " 的坏屏坚持者"
+        let v = p >= 0.999 ? String(format: "%.2f%%", p * 100) : String(format: "%.1f%%", p * 100)
+        return L("超过全球约 \(v) 的坏屏坚持者", "More damaged than ~\(v) of broken-screen holdouts worldwide")
     }
 
     static func oneIn(_ d: Double) -> String? {
         let n = 1 / max(1 - percentile(d), 0.0001)
-        return n >= 10 ? "约 \(Int(n.rounded())) 人里才有 1 个比你更狠" : nil
+        return n >= 10 ? L("约 \(Int(n.rounded())) 人里才有 1 个比你更狠", "Only 1 in ~\(Int(n.rounded())) is more hardcore than you") : nil
     }
 
     static func text(_ d: Double) -> String { [beat(d), oneIn(d)].compactMap { $0 }.joined(separator: " · ") }
@@ -1460,28 +1611,28 @@ struct Achievement: Identifiable {
     let id: String, emoji: String, title: String, desc: String
     let check: (Metrics) -> Bool
 
-    static let all: [Achievement] = [
-        Achievement(id: "d1", emoji: "🌱", title: "初来乍到", desc: "第一次标记坏区") { $0.days >= 1 },
-        Achievement(id: "d3", emoji: "🔧", title: "将就着用", desc: "用坏屏幕 3 天") { $0.days >= 3 },
-        Achievement(id: "d7", emoji: "📅", title: "坚持一周", desc: "用坏屏幕 7 天") { $0.days >= 7 },
-        Achievement(id: "d10", emoji: "🏅", title: "你真是个人才", desc: "用坏屏幕 10 天") { $0.days >= 10 },
-        Achievement(id: "d30", emoji: "🧱", title: "一个月了还没换？", desc: "用坏屏幕 30 天") { $0.days >= 30 },
-        Achievement(id: "d100", emoji: "💯", title: "百日筑基", desc: "用坏屏幕 100 天") { $0.days >= 100 },
-        Achievement(id: "d365", emoji: "👑", title: "年度钉子户", desc: "用坏屏幕 365 天") { $0.days >= 365 },
+    static var all: [Achievement] { [
+        Achievement(id: "d1", emoji: "🌱", title: L("初来乍到", "First Steps"), desc: L("第一次标记坏区", "Mark your first dead zone")) { $0.days >= 1 },
+        Achievement(id: "d3", emoji: "🔧", title: L("将就着用", "Making Do"), desc: L("用坏屏幕 3 天", "Use a broken screen for 3 days")) { $0.days >= 3 },
+        Achievement(id: "d7", emoji: "📅", title: L("坚持一周", "One Week Strong"), desc: L("用坏屏幕 7 天", "Use a broken screen for 7 days")) { $0.days >= 7 },
+        Achievement(id: "d10", emoji: "🏅", title: L("你真是个人才", "What a Legend"), desc: L("用坏屏幕 10 天", "Use a broken screen for 10 days")) { $0.days >= 10 },
+        Achievement(id: "d30", emoji: "🧱", title: L("一个月了还没换？", "A Month and Still No New One?"), desc: L("用坏屏幕 30 天", "Use a broken screen for 30 days")) { $0.days >= 30 },
+        Achievement(id: "d100", emoji: "💯", title: L("百日筑基", "Hundred-Day Foundation"), desc: L("用坏屏幕 100 天", "Use a broken screen for 100 days")) { $0.days >= 100 },
+        Achievement(id: "d365", emoji: "👑", title: L("年度钉子户", "Holdout of the Year"), desc: L("用坏屏幕 365 天", "Use a broken screen for 365 days")) { $0.days >= 365 },
 
-        Achievement(id: "a5", emoji: "💧", title: "洒洒水啦", desc: "屏幕损坏面积达到 5%") { $0.maxDamage >= 0.05 },
-        Achievement(id: "a30", emoji: "💪", title: "身残志坚", desc: "屏幕损坏面积达到 30%") { $0.maxDamage >= 0.30 },
-        Achievement(id: "a50", emoji: "🏯", title: "半壁江山", desc: "屏幕损坏面积达到 50%") { $0.maxDamage >= 0.50 },
-        Achievement(id: "a70", emoji: "🧮", title: "勤俭持家小能手", desc: "屏幕损坏面积达到 70%") { $0.maxDamage >= 0.70 },
-        Achievement(id: "a90", emoji: "🪦", title: "这就别用了吧", desc: "屏幕损坏面积达到 90%") { $0.maxDamage >= 0.90 },
+        Achievement(id: "a5", emoji: "💧", title: L("洒洒水啦", "No Biggie"), desc: L("屏幕损坏面积达到 5%", "Damaged area reaches 5%")) { $0.maxDamage >= 0.05 },
+        Achievement(id: "a30", emoji: "💪", title: L("身残志坚", "Broken but Unbowed"), desc: L("屏幕损坏面积达到 30%", "Damaged area reaches 30%")) { $0.maxDamage >= 0.30 },
+        Achievement(id: "a50", emoji: "🏯", title: L("半壁江山", "Half an Empire"), desc: L("屏幕损坏面积达到 50%", "Damaged area reaches 50%")) { $0.maxDamage >= 0.50 },
+        Achievement(id: "a70", emoji: "🧮", title: L("勤俭持家小能手", "Master of Thrift"), desc: L("屏幕损坏面积达到 70%", "Damaged area reaches 70%")) { $0.maxDamage >= 0.70 },
+        Achievement(id: "a90", emoji: "🪦", title: L("这就别用了吧", "Please, Just Replace It"), desc: L("屏幕损坏面积达到 90%", "Damaged area reaches 90%")) { $0.maxDamage >= 0.90 },
 
-        Achievement(id: "shapes5", emoji: "🧩", title: "精雕细琢", desc: "一块屏幕上标记 5 块以上坏区") { $0.maxShapes >= 5 },
-        Achievement(id: "line", emoji: "📏", title: "一线之隔", desc: "标记一条坏线") { $0.hasLine },
-        Achievement(id: "multi", emoji: "🖥️", title: "难兄难弟", desc: "两块以上屏幕都有坏区") { $0.brokenScreens >= 2 },
-        Achievement(id: "block100", emoji: "🚧", title: "此路不通", desc: "鼠标撞墙 100 次") { $0.blocks >= 100 },
-        Achievement(id: "block10k", emoji: "🐂", title: "撞了南墙也不回头", desc: "鼠标撞墙 10000 次") { $0.blocks >= 10_000 },
-        Achievement(id: "move100", emoji: "📦", title: "窗口搬运工", desc: "窗口被推开 100 次") { $0.moves >= 100 },
-    ]
+        Achievement(id: "shapes5", emoji: "🧩", title: L("精雕细琢", "Meticulous"), desc: L("一块屏幕上标记 5 块以上坏区", "Mark 5+ dead zones on one screen")) { $0.maxShapes >= 5 },
+        Achievement(id: "line", emoji: "📏", title: L("一线之隔", "A Fine Line"), desc: L("标记一条坏线", "Mark a dead line")) { $0.hasLine },
+        Achievement(id: "multi", emoji: "🖥️", title: L("难兄难弟", "Brothers in Misfortune"), desc: L("两块以上屏幕都有坏区", "Dead zones on 2+ screens")) { $0.brokenScreens >= 2 },
+        Achievement(id: "block100", emoji: "🚧", title: L("此路不通", "Dead End"), desc: L("鼠标撞墙 100 次", "Cursor hits the wall 100 times")) { $0.blocks >= 100 },
+        Achievement(id: "block10k", emoji: "🐂", title: L("撞了南墙也不回头", "Stubborn as a Mule"), desc: L("鼠标撞墙 10000 次", "Cursor hits the wall 10,000 times")) { $0.blocks >= 10_000 },
+        Achievement(id: "move100", emoji: "📦", title: L("窗口搬运工", "Window Mover"), desc: L("窗口被推开 100 次", "Windows pushed away 100 times")) { $0.moves >= 100 },
+    ] }
 }
 
 // MARK: - 统计（本地保存，不联网）
@@ -1528,7 +1679,7 @@ struct ToastView: View {
         HStack(spacing: 14) {
             Text(a.emoji).font(.system(size: 38))
             VStack(alignment: .leading, spacing: 3) {
-                Text("解锁成就").font(.caption).foregroundStyle(.secondary)
+                Text(L("解锁成就", "Achievement Unlocked")).font(.caption).foregroundStyle(.secondary)
                 Text(a.title).font(.title3.bold())
                 Text(a.desc).font(.callout).foregroundStyle(.secondary)
             }
@@ -1647,7 +1798,7 @@ struct DamageCard: View {
             HStack(alignment: .firstTextBaseline) {
                 Text(s.name).font(.headline)
                 Spacer()
-                Text("\(s.shapes) 块坏区").font(.caption).foregroundStyle(.secondary)
+                Text(L("\(s.shapes) 块坏区", "\(s.shapes) dead zone(s)")).font(.caption).foregroundStyle(.secondary)
             }
             HStack(alignment: .center, spacing: 16) {
                 Text(pct(s.damage)).font(.system(size: 44, weight: .bold, design: .rounded)).monospacedDigit()
@@ -1707,13 +1858,13 @@ struct ShareCard: View {
         let t = Tier.of(w?.damage ?? 0)
         VStack(alignment: .leading, spacing: 14) {
             HStack {
-                Text("DeadZone 坏屏战绩").font(.system(size: 15, weight: .semibold)).foregroundStyle(.white.opacity(0.8))
+                Text(L("DeadZone 坏屏战绩", "DeadZone Broken-Screen Stats")).font(.system(size: 15, weight: .semibold)).foregroundStyle(.white.opacity(0.8))
                 Spacer()
                 Text("🏆 \(r.unlocked.count)/\(Achievement.all.count)").font(.system(size: 14, weight: .semibold)).foregroundStyle(.white)
             }
             HStack(alignment: .center, spacing: 18) {
                 VStack(alignment: .leading, spacing: 0) {
-                    Text("屏幕损坏面积").font(.system(size: 12)).foregroundStyle(.white.opacity(0.7))
+                    Text(L("屏幕损坏面积", "Damaged area")).font(.system(size: 12)).foregroundStyle(.white.opacity(0.7))
                     Text(pct(w?.damage ?? 0)).font(.system(size: 52, weight: .heavy, design: .rounded)).foregroundStyle(.white)
                 }
                 VStack(alignment: .leading, spacing: 4) {
@@ -1728,7 +1879,7 @@ struct ShareCard: View {
                     Text(o).font(.system(size: 13)).foregroundStyle(.white.opacity(0.85)).padding(.leading, 24)
                 }
             }
-            Text("已坚持使用 \(r.days) 天 · 鼠标撞墙 \(r.blocks) 次 · 窗口被推开 \(r.moves) 次")
+            Text(L("已坚持使用 \(r.days) 天 · 鼠标撞墙 \(r.blocks) 次 · 窗口被推开 \(r.moves) 次", "\(r.days) days in use · \(r.blocks) wall hits · \(r.moves) windows moved"))
                 .font(.system(size: 13)).foregroundStyle(.white.opacity(0.85))
             Text("github.com/prefect12/DeadZone").font(.system(size: 11, design: .monospaced)).foregroundStyle(.white.opacity(0.6))
         }
@@ -1747,26 +1898,26 @@ struct StatsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 if report.screens.isEmpty {
-                    Text("还没有标记坏区。标记之后，这里会显示你的损坏面积和段位。").foregroundStyle(.secondary)
+                    Text(L("还没有标记坏区。标记之后，这里会显示你的损坏面积和段位。", "No dead zones yet. Once you mark some, your damage and tier will show up here.")).foregroundStyle(.secondary)
                 }
                 ForEach(report.screens) { DamageCard(s: $0) }
 
                 HStack(spacing: 10) {
-                    StatTile(label: "坚持使用", value: "\(report.days) 天")
-                    StatTile(label: "鼠标撞墙", value: "\(report.blocks) 次")
-                    StatTile(label: "窗口被推开", value: "\(report.moves) 次")
+                    StatTile(label: L("坚持使用", "Days in use"), value: L("\(report.days) 天", "\(report.days)"))
+                    StatTile(label: L("鼠标撞墙", "Wall hits"), value: L("\(report.blocks) 次", "\(report.blocks)"))
+                    StatTile(label: L("窗口被推开", "Windows moved"), value: L("\(report.moves) 次", "\(report.moves)"))
                 }
 
                 HStack {
-                    Text("成就").font(.headline)
+                    Text(L("成就", "Achievements")).font(.headline)
                     Text("\(report.unlocked.count)/\(Achievement.all.count)").foregroundStyle(.secondary)
                     Spacer()
-                    Button(copied ? "已复制到剪贴板 ✓" : "复制战绩卡片") { copyCard() }
+                    Button(copied ? L("已复制到剪贴板 ✓", "Copied to clipboard ✓") : L("复制战绩卡片", "Copy Stats Card")) { copyCard() }
                 }
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 160), spacing: 8)], spacing: 8) {
                     ForEach(Achievement.all) { BadgeView(a: $0, date: report.unlocked[$0.id]) }
                 }
-                Text("所有统计只保存在本机，不联网。").font(.caption2).foregroundStyle(.tertiary)
+                Text(L("所有统计只保存在本机，不联网。", "All stats stay on this Mac. Nothing goes online.")).font(.caption2).foregroundStyle(.tertiary)
             }
             .padding(22)
         }
@@ -1814,7 +1965,7 @@ struct HistoryRecord: Identifiable {
         self.id = id
         date = Date(timeIntervalSince1970: t)
         self.uuid = uuid
-        name = d["name"] as? String ?? "未知屏幕"
+        name = d["name"] as? String ?? L("未知屏幕", "Unknown screen")
         aspect = CGFloat(d["aspect"] as? Double ?? 16.0 / 9)
         shapes = list.compactMap(Shape.init(dict:))
         damage = d["damage"] as? Double ?? 0
@@ -1853,8 +2004,16 @@ enum History {
 
 final class AppModel: ObservableObject {
     enum Tab: String, CaseIterable, Identifiable {
-        case screens = "屏幕", history = "圈选记录", achievements = "成就与战绩", settings = "设置"
+        case screens, history, achievements, settings
         var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .screens: return L("屏幕", "Screens")
+            case .history: return L("圈选记录", "History")
+            case .achievements: return L("成就与战绩", "Achievements")
+            case .settings: return L("设置", "Settings")
+            }
+        }
         var icon: String {
             switch self {
             case .screens: return "display.2"
@@ -1881,6 +2040,13 @@ final class AppModel: ObservableObject {
     @Published var avoidWindows = true { didSet { persist("avoidWindows", avoidWindows) } }
     @Published var windowsCrossThin = false { didSet { persist("windowsCrossThin", windowsCrossThin) } }
     @Published var blockMouse = true { didSet { persist("blockMouse", blockMouse) } }
+    @Published var language = "system" {
+        didSet {
+            guard !loading else { return }
+            Store.defaults.set(language, forKey: "language")
+            onSettingsChanged()
+        }
+    }
 
     var onEdit: (String) -> Void = { _ in }
     var onClear: (String) -> Void = { _ in }
@@ -1913,6 +2079,7 @@ final class AppModel: ObservableObject {
         avoidWindows = Store.bool("avoidWindows", default: true)
         windowsCrossThin = Store.bool("windowsCrossThin", default: false)
         blockMouse = Store.bool("blockMouse", default: true)
+        language = Lang.setting
     }
 
     func currentShapes(for uuid: String) -> [Shape]? { screens.first { $0.id == uuid }?.shapes }
@@ -1950,11 +2117,11 @@ struct AXBanner: View {
             HStack(spacing: 10) {
                 Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("需要辅助功能权限").font(.headline)
-                    Text("没有这个权限就无法移动窗口和拦截鼠标").font(.caption).foregroundStyle(.secondary)
+                    Text(L("需要辅助功能权限", "Accessibility permission needed")).font(.headline)
+                    Text(L("没有这个权限就无法移动窗口和拦截鼠标", "Without it, DeadZone can't move windows or block the cursor")).font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("去授权") { model.onOpenAX() }
+                Button(L("去授权", "Grant Access")) { model.onOpenAX() }
             }
             .padding(12)
             .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
@@ -1975,20 +2142,20 @@ struct ScreensView: View {
                             Text(s.name).font(.title3.bold())
                             Text("\(Int(s.size.width)) × \(Int(s.size.height))").font(.caption).foregroundStyle(.secondary)
                             if s.shapes.isEmpty {
-                                Text("还没有圈选坏区").foregroundStyle(.secondary)
+                                Text(L("还没有圈选坏区", "No dead zones marked")).foregroundStyle(.secondary)
                             } else {
                                 let t = Tier.of(s.damage)
                                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                                     Text(pct(s.damage)).font(.system(size: 26, weight: .bold, design: .rounded)).monospacedDigit()
                                     Text("\(t.emoji) \(t.name)").font(.headline)
                                 }
-                                Text("\(s.shapes.count) 块坏区").font(.caption).foregroundStyle(.secondary)
+                                Text(L("\(s.shapes.count) 块坏区", "\(s.shapes.count) dead zone(s)")).font(.caption).foregroundStyle(.secondary)
                             }
                             HStack {
-                                Button(s.shapes.isEmpty ? "圈选坏区" : "编辑坏区") { model.onEdit(s.id) }
+                                Button(s.shapes.isEmpty ? L("圈选坏区", "Mark Dead Zones") : L("编辑坏区", "Edit Dead Zones")) { model.onEdit(s.id) }
                                     .buttonStyle(.borderedProminent)
                                 if !s.shapes.isEmpty {
-                                    Button("清除") { model.onClear(s.id) }
+                                    Button(L("清除", "Clear")) { model.onClear(s.id) }
                                 }
                             }
                             .padding(.top, 4)
@@ -1998,7 +2165,7 @@ struct ScreensView: View {
                     .padding(16)
                     .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 14))
                 }
-                Text("提示：编辑时按 Tab 可以保存并切换到下一块屏幕。每次保存都会自动存一条圈选记录。")
+                Text(L("提示：编辑时按 Tab 可以保存并切换到下一块屏幕。每次保存都会自动存一条圈选记录。", "Tip: press Tab while editing to save and move to the next screen. Every save is recorded in History."))
                     .font(.caption).foregroundStyle(.secondary)
             }
             .padding(22)
@@ -2012,8 +2179,8 @@ struct HistoryView: View {
         if model.history.isEmpty {
             VStack(spacing: 10) {
                 Image(systemName: "clock.arrow.circlepath").font(.system(size: 40)).foregroundStyle(.secondary)
-                Text("还没有圈选记录").font(.headline)
-                Text("每次在编辑界面保存，都会在这里留下一条记录，可以随时应用回去。")
+                Text(L("还没有圈选记录", "No history yet")).font(.headline)
+                Text(L("每次在编辑界面保存，都会在这里留下一条记录，可以随时应用回去。", "Every time you save in the editor, a record appears here. You can apply it again any time."))
                     .font(.callout).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -2037,22 +2204,22 @@ struct HistoryView: View {
                 HStack(spacing: 6) {
                     Text(r.date.formatted(date: .abbreviated, time: .shortened)).font(.headline)
                     if isCurrent {
-                        Text("当前").font(.caption2.bold()).padding(.horizontal, 6).padding(.vertical, 2)
+                        Text(L("当前", "Current")).font(.caption2.bold()).padding(.horizontal, 6).padding(.vertical, 2)
                             .background(Color.green.opacity(0.2), in: Capsule())
                     }
                 }
-                Text(r.name + (connected ? "" : "（未连接）")).font(.callout).foregroundStyle(.secondary)
-                Text(r.shapes.isEmpty ? "无坏区" : "\(r.shapes.count) 块坏区 · 损坏 \(pct(r.damage)) · \(Tier.of(r.damage).emoji) \(Tier.of(r.damage).name)")
+                Text(r.name + (connected ? "" : L("（未连接）", " (not connected)"))).font(.callout).foregroundStyle(.secondary)
+                Text(r.shapes.isEmpty ? L("无坏区", "No dead zones") : L("\(r.shapes.count) 块坏区 · 损坏 \(pct(r.damage))", "\(r.shapes.count) dead zone(s) · \(pct(r.damage)) damaged") + " · \(Tier.of(r.damage).emoji) \(Tier.of(r.damage).name)")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
-            Button("应用") { model.onApply(r) }
+            Button(L("应用", "Apply")) { model.onApply(r) }
                 .disabled(!connected || isCurrent)
-                .help(connected ? "把这块屏幕的坏区恢复成这条记录" : "这块屏幕现在没有连接")
+                .help(connected ? L("把这块屏幕的坏区恢复成这条记录", "Restore this screen's dead zones to this record") : L("这块屏幕现在没有连接", "This screen isn't connected"))
             Button(role: .destructive) { History.remove(r.id); model.history = History.all() } label: {
                 Image(systemName: "trash")
             }
-            .help("删除这条记录")
+            .help(L("删除这条记录", "Delete this record"))
         }
         .padding(12)
         .background(isCurrent ? Color.green.opacity(0.06) : Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 12))
@@ -2068,39 +2235,44 @@ struct SettingsView: View {
             Section {
                 AXBanner(model: model)
                 if model.axTrusted {
-                    Label("辅助功能权限已开启", systemImage: "checkmark.seal.fill").foregroundStyle(.green)
+                    Label(L("辅助功能权限已开启", "Accessibility permission granted"), systemImage: "checkmark.seal.fill").foregroundStyle(.green)
                 }
             }
-            Section("坏区") {
+            Section(L("坏区", "Dead Zones")) {
                 Toggle(isOn: $model.showOverlay) {
-                    Text("黑色遮罩坏区"); Text("用纯黑盖住坏区，减少花屏干扰")
+                    Text(L("黑色遮罩坏区", "Black out dead zones")); Text(L("用纯黑盖住坏区，减少花屏干扰", "Cover dead zones with solid black to hide flicker"))
                 }
                 Toggle(isOn: $model.avoidWindows) {
-                    Text("自动把窗口移出坏区"); Text("窗口进入坏区后自动推开；最大化和全屏会避开坏区")
+                    Text(L("自动把窗口移出坏区", "Move windows out of dead zones")); Text(L("窗口进入坏区后自动推开；最大化和全屏会避开坏区", "Windows are pushed out; maximize and full screen avoid dead zones"))
                 }
                 Toggle(isOn: $model.windowsCrossThin) {
-                    Text("允许窗口跨过细线坏区"); Text("宽度不超过 40pt 的坏线不再阻挡窗口，避免屏幕被一分为二")
+                    Text(L("允许窗口跨过细线坏区", "Let windows cross thin dead lines")); Text(L("宽度不超过 40pt 的坏线不再阻挡窗口，避免屏幕被一分为二", "Lines up to 40pt wide no longer block windows, so the screen isn't split in two"))
                 }
                 .disabled(!model.avoidWindows)
                 Toggle(isOn: $model.blockMouse) {
-                    Text("阻止鼠标进入坏区"); Text("大块坏区贴边滑动，细线直接跳过")
+                    Text(L("阻止鼠标进入坏区", "Keep the cursor out of dead zones")); Text(L("大块坏区贴边滑动，细线直接跳过", "Slides along large areas, jumps over thin lines"))
                 }
             }
-            Section("通用") {
-                Toggle("开机自动启动", isOn: Binding(get: { model.loginEnabled }, set: { _ in model.onToggleLogin() }))
-                Button("清除全部坏区…", role: .destructive) { confirmClear = true }
+            Section(L("通用", "General")) {
+                Picker(L("语言", "Language"), selection: $model.language) {
+                    Text(L("跟随系统", "System")).tag("system")
+                    Text("中文").tag("zh")
+                    Text("English").tag("en")
+                }
+                Toggle(L("开机自动启动", "Launch at login"), isOn: Binding(get: { model.loginEnabled }, set: { _ in model.onToggleLogin() }))
+                Button(L("清除全部坏区…", "Clear All Dead Zones…"), role: .destructive) { confirmClear = true }
             }
-            Section("关于") {
-                LabeledContent("版本", value: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "-")
+            Section(L("关于", "About")) {
+                LabeledContent(L("版本", "Version"), value: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "-")
                 Link("GitHub：prefect12/DeadZone", destination: URL(string: "https://github.com/prefect12/DeadZone")!)
-                Text("所有数据只保存在本机，不联网。").font(.caption).foregroundStyle(.secondary)
+                Text(L("所有数据只保存在本机，不联网。", "All data stays on this Mac. Nothing goes online.")).font(.caption).foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
-        .confirmationDialog("清除所有屏幕上的坏区？", isPresented: $confirmClear) {
-            Button("清除", role: .destructive) { model.onClearAll() }
+        .confirmationDialog(L("清除所有屏幕上的坏区？", "Clear dead zones on all screens?"), isPresented: $confirmClear) {
+            Button(L("清除", "Clear"), role: .destructive) { model.onClearAll() }
         } message: {
-            Text("圈选记录会保留，之后可以从记录里恢复。")
+            Text(L("圈选记录会保留，之后可以从记录里恢复。", "History is kept, so you can restore from it later."))
         }
     }
 }
@@ -2110,7 +2282,7 @@ struct MainView: View {
     var body: some View {
         NavigationSplitView {
             List(AppModel.Tab.allCases, selection: Binding(get: { model.tab }, set: { if let t = $0 { model.tab = t } })) { t in
-                Label(t.rawValue, systemImage: t.icon).tag(t)
+                Label(t.title, systemImage: t.icon).tag(t)
             }
             .navigationSplitViewColumnWidth(170)
         } detail: {
@@ -2122,7 +2294,7 @@ struct MainView: View {
                 case .settings: SettingsView(model: model)
                 }
             }
-            .navigationTitle(model.tab.rawValue)
+            .navigationTitle(model.tab.title)
         }
         .frame(minWidth: 780, minHeight: 560)
     }
@@ -2292,17 +2464,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        menu.addItem(item("打开 DeadZone…", #selector(openMain), key: ","))
+        menu.addItem(item(L("打开 DeadZone…", "Open DeadZone…"), #selector(openMain), key: ","))
         menu.addItem(.separator())
 
-        let names = zones.map { "\($0.screen.localizedName)（\(Store.shapes(for: $0.screen).count) 块）" }
-        menu.addItem(disabled(names.isEmpty ? "还没有设置坏区" : "已屏蔽：" + names.joined(separator: "、")))
+        let names = zones.map { "\($0.screen.localizedName) (\(Store.shapes(for: $0.screen).count))" }
+        menu.addItem(disabled(names.isEmpty ? L("还没有设置坏区", "No dead zones yet") : L("已屏蔽：", "Blocked: ") + names.joined(separator: ", ")))
         if !AXIsProcessTrusted() {
-            menu.addItem(item("⚠️ 需要辅助功能权限（点此授权）", #selector(openAXSettings)))
+            menu.addItem(item(L("⚠️ 需要辅助功能权限（点此授权）", "⚠️ Accessibility permission needed (click to grant)"), #selector(openAXSettings)))
         }
         menu.addItem(.separator())
 
-        let editItem = NSMenuItem(title: "编辑坏区…", action: nil, keyEquivalent: "")
+        let editItem = NSMenuItem(title: L("编辑坏区…", "Edit Dead Zones…"), action: nil, keyEquivalent: "")
         let sub = NSMenu()
         for (i, s) in NSScreen.screens.enumerated() {
             let it = item(s.title + (Store.shapes(for: s).isEmpty ? "" : "  ●"), #selector(editScreen(_:)))
@@ -2311,22 +2483,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         editItem.submenu = sub
         menu.addItem(editItem)
-        menu.addItem(item("清除全部坏区", #selector(clearAll)))
+        menu.addItem(item(L("清除全部坏区", "Clear All Dead Zones"), #selector(clearAll)))
         menu.addItem(.separator())
         let worst = zones.map(\.damage).max()
-        let head = worst.map { "成就与战绩…  \(Tier.of($0).emoji) \(pct($0))" } ?? "成就与战绩…"
+        let head = worst.map { L("成就与战绩…", "Achievements…") + "  \(Tier.of($0).emoji) \(pct($0))" } ?? L("成就与战绩…", "Achievements…")
         menu.addItem(item(head, #selector(showStats)))
         menu.addItem(.separator())
 
-        menu.addItem(toggle("黑色遮罩坏区", "showOverlay", showOverlay))
-        menu.addItem(toggle("自动把窗口移出坏区", "avoidWindows", avoidWindows))
-        menu.addItem(toggle("允许窗口跨过细线坏区（≤40pt）", "windowsCrossThin", windowsCrossThin))
-        menu.addItem(toggle("阻止鼠标进入坏区", "blockMouse", blockMouse))
-        let login = item("开机自动启动", #selector(toggleLogin))
+        menu.addItem(toggle(L("黑色遮罩坏区", "Black Out Dead Zones"), "showOverlay", showOverlay))
+        menu.addItem(toggle(L("自动把窗口移出坏区", "Move Windows Out of Dead Zones"), "avoidWindows", avoidWindows))
+        menu.addItem(toggle(L("允许窗口跨过细线坏区（≤40pt）", "Let Windows Cross Thin Lines (≤40pt)"), "windowsCrossThin", windowsCrossThin))
+        menu.addItem(toggle(L("阻止鼠标进入坏区", "Keep Cursor Out of Dead Zones"), "blockMouse", blockMouse))
+        let langItem = NSMenuItem(title: L("语言", "Language"), action: nil, keyEquivalent: "")
+        let langMenu = NSMenu()
+        for (code, title) in [("system", L("跟随系统", "System")), ("zh", "中文"), ("en", "English")] {
+            let it = item(title, #selector(setLanguage(_:)))
+            it.representedObject = code
+            it.state = Lang.setting == code ? .on : .off
+            langMenu.addItem(it)
+        }
+        langItem.submenu = langMenu
+        menu.addItem(langItem)
+        let login = item(L("开机自动启动", "Launch at Login"), #selector(toggleLogin))
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login)
         menu.addItem(.separator())
-        menu.addItem(item("退出", #selector(quit), key: "q"))
+        menu.addItem(item(L("退出", "Quit"), #selector(quit), key: "q"))
     }
 
     private func item(_ t: String, _ a: Selector, key: String = "") -> NSMenuItem {
@@ -2359,12 +2541,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if SMAppService.mainApp.status == .enabled { try SMAppService.mainApp.unregister() }
             else { try SMAppService.mainApp.register() }
         } catch {
-            let a = NSAlert(); a.messageText = "设置开机启动失败"; a.informativeText = error.localizedDescription; a.runModal()
+            let a = NSAlert(); a.messageText = L("设置开机启动失败", "Couldn't change launch at login"); a.informativeText = error.localizedDescription; a.runModal()
         }
     }
     @objc func openAXSettings() {
         requestAccessibility()
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+    }
+    @objc func setLanguage(_ sender: NSMenuItem) {
+        guard let code = sender.representedObject as? String else { return }
+        Store.defaults.set(code, forKey: "language")
+        reload()
     }
     @objc func quit() { NSApp.terminate(nil) }
 }
