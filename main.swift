@@ -1294,9 +1294,6 @@ struct DamageCard: View {
             HStack(spacing: 6) {
                 Image(systemName: "globe.asia.australia")
                 Text(Ranking.text(s.damage))
-                Text("估算").font(.caption2).padding(.horizontal, 5).padding(.vertical, 1)
-                    .background(Color.secondary.opacity(0.15), in: Capsule())
-                    .help("根据公开调查的量级估算，仅供娱乐：约 18% 的美国人在用碎屏手机，碎屏后约 34% 继续使用；约 20–30% 的显示器有坏点。")
             }
             .font(.callout).foregroundStyle(.secondary)
         }
@@ -1359,7 +1356,7 @@ struct ShareCard: View {
                 }
             }
             VStack(alignment: .leading, spacing: 3) {
-                Text("🌏 " + Ranking.beat(w?.damage ?? 0) + "（估算）")
+                Text("🌏 " + Ranking.beat(w?.damage ?? 0))
                     .font(.system(size: 14, weight: .semibold)).foregroundStyle(.white)
                 if let o = Ranking.oneIn(w?.damage ?? 0) {
                     Text(o).font(.system(size: 13)).foregroundStyle(.white.opacity(0.85)).padding(.leading, 24)
