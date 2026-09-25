@@ -105,6 +105,12 @@ func cubicPoint(_ a: CGPoint, _ c1: CGPoint, _ c2: CGPoint, _ b: CGPoint, _ t: C
     return CGPoint(x: x, y: y)
 }
 
+extension CGPath {
+    static func poly(_ pts: [CGPoint]) -> CGPath {
+        let p = CGMutablePath(); p.addLines(between: pts); p.closeSubpath(); return p
+    }
+}
+
 /// 把路径拍平成线段（曲线按采样近似），用于把鼠标投影到坏区边缘
 func flatten(_ path: CGPath) -> [(CGPoint, CGPoint)] {
     var segs: [(CGPoint, CGPoint)] = []
@@ -671,10 +677,11 @@ private func mouseTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: 
 // 屏幕上有一个浮动工具栏：切换工具、调线宽、撤销/清空、保存，并实时提示下一步该做什么。
 
 enum EditorTool: String, CaseIterable, Identifiable {
-    case polygon = "多边形", rect = "矩形", line = "线条"
+    case split = "分割", polygon = "多边形", rect = "矩形", line = "线条"
     var id: String { rawValue }
     var icon: String {
         switch self {
+        case .split: return "square.split.diagonal"
         case .polygon: return "pentagon"
         case .rect: return "rectangle"
         case .line: return "line.diagonal"
@@ -682,13 +689,15 @@ enum EditorTool: String, CaseIterable, Identifiable {
     }
     var key: String {
         switch self {
-        case .polygon: return "1"
-        case .rect: return "2"
-        case .line: return "3"
+        case .split: return "1"
+        case .polygon: return "2"
+        case .rect: return "3"
+        case .line: return "4"
         }
     }
     var usage: String {
         switch self {
+        case .split: return "一边全黑看不清：画分界线，选一边"
         case .polygon: return "任意形状的斑块、角落"
         case .rect: return "规整的矩形区域"
         case .line: return "竖线、横线、裂纹"
@@ -698,7 +707,9 @@ enum EditorTool: String, CaseIterable, Identifiable {
 
 /// 编辑器与工具栏共享的状态
 final class EditorState: ObservableObject {
-    @Published var tool: EditorTool = .polygon
+    @Published var tool: EditorTool = .split
+    @Published var splitLabels: [String] = []    // 分割后两边的名字，非空表示正在选边
+    @Published var hoverSide: Int?
     @Published var lineWidth: CGFloat = 8
     @Published var points = 0
     @Published var dragging = false
@@ -707,10 +718,15 @@ final class EditorState: ObservableObject {
     @Published var screenLabel = ""
     @Published var multiScreen = false
 
-    var drawing: Bool { points > 0 || dragging }
+    var drawing: Bool { points > 0 || dragging || !splitLabels.isEmpty }
 
     var step: (icon: String, text: String) {
         switch tool {
+        case .split:
+            if !splitLabels.isEmpty { return ("4.circle.fill", "选择哪一边是坏区：点下面的按钮（鼠标移上去可以预览），或直接点击那一边") }
+            if points == 0 { return ("1.circle.fill", "沿着黑区的边界画一条分界线：先在线的一端单击（不用点到屏幕边缘，会自动延伸过去）") }
+            if points < 2 { return ("2.circle.fill", "继续沿边界单击，或按住拖动描出分界线") }
+            return ("3.circle.fill", "双击 或 按回车，完成分界线 · 已放 \(points) 个点")
         case .polygon:
             if points == 0 { return ("1.circle.fill", "在坏区边缘单击，放下第一个点（在看得见的一侧；也可以按住拖动描边）") }
             if points < 3 { return ("2.circle.fill", "继续沿边缘单击，把坏区围起来 · 已放 \(points) 个点，至少要 3 个") }
@@ -726,6 +742,8 @@ final class EditorState: ObservableObject {
 
     // 工具栏上的操作，由 EditorView 实现
     var setTool: (EditorTool) -> Void = { _ in }
+    var chooseSide: (Int) -> Void = { _ in }
+    var hoverChanged: () -> Void = {}
     var undo: () -> Void = {}
     var clear: () -> Void = {}
     var finishShape: () -> Void = {}
@@ -782,6 +800,23 @@ struct EditorToolbar: View {
                     .disabled(s.shapeCount == 0 && !s.drawing).help("清空这块屏幕的全部坏区")
             }
 
+            if !s.splitLabels.isEmpty {
+                HStack(spacing: 10) {
+                    ForEach(Array(s.splitLabels.enumerated()), id: \.offset) { i, label in
+                        Button { s.chooseSide(i) } label: {
+                            Text("把「\(label)」设为坏区").font(.system(size: 14, weight: .semibold))
+                                .frame(maxWidth: .infinity).padding(.vertical, 6)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(s.hoverSide == i ? .red : .gray)
+                        .onHover { h in
+                            if h { s.hoverSide = i } else if s.hoverSide == i { s.hoverSide = nil }
+                            s.hoverChanged()
+                        }
+                    }
+                }
+            }
+
             HStack(alignment: .top, spacing: 8) {
                 Image(systemName: s.step.icon).font(.system(size: 18)).foregroundStyle(Color.yellow)
                 Text(s.step.text).font(.system(size: 14, weight: .medium)).fixedSize(horizontal: false, vertical: true)
@@ -795,8 +830,8 @@ struct EditorToolbar: View {
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button("取消") { s.cancel() }.keyboardShortcut(.cancelAction)
-                if s.drawing && s.tool != .rect {
-                    Button("完成这一块") { s.finishShape() }
+                if s.drawing && s.tool != .rect && s.splitLabels.isEmpty {
+                    Button(s.tool == .split ? "完成分界线" : "完成这一块") { s.finishShape() }
                 }
                 Button("保存并退出") { s.save() }.buttonStyle(.borderedProminent)
             }
@@ -824,11 +859,16 @@ final class EditorView: NSView {
     private var undoStack: [[Shape]] = []
     private let snapDist: CGFloat = 16
     private var toolbar: NSHostingView<EditorToolbar>!
+    private var sides: [[CGPoint]] = []         // 分割后的两边（视图坐标）
+    private var sideNames: [String] = []
+    private var splitLine: [CGPoint] = []
 
     init(frame: NSRect, shapes: [Shape]) {
         self.shapes = shapes
         super.init(frame: frame)
         state.setTool = { [weak self] t in self?.setTool(t) }
+        state.chooseSide = { [weak self] i in self?.choose(i) }
+        state.hoverChanged = { [weak self] in self?.needsDisplay = true }
         state.undo = { [weak self] in self?.undo() }
         state.clear = { [weak self] in self?.clearAll() }
         state.finishShape = { [weak self] in self?.finish() }
@@ -854,7 +894,8 @@ final class EditorView: NSView {
 
     private var W: CGFloat { bounds.width }
     private var H: CGFloat { bounds.height }
-    private var drawing: Bool { !pts.isEmpty || dragRect != nil }
+    private var drawing: Bool { !pts.isEmpty || dragRect != nil || !sides.isEmpty }
+    private var choosing: Bool { !sides.isEmpty }
 
     private func rel(_ p: CGPoint) -> CGPoint { CGPoint(x: p.x / W, y: p.y / H) }
     private func loc(_ e: NSEvent) -> CGPoint { convert(e.locationInWindow, from: nil) }
@@ -862,6 +903,8 @@ final class EditorView: NSView {
     /// 把状态同步给工具栏，并把工具栏放到不挡坏区的地方
     private func sync() {
         state.points = pts.count
+        state.splitLabels = sideNames
+        if sides.isEmpty { state.hoverSide = nil }
         state.dragging = dragRect != nil
         state.shapeCount = shapes.count
         state.canUndo = !undoStack.isEmpty
@@ -906,7 +949,14 @@ final class EditorView: NSView {
     }
 
     private func finish() {
+        if choosing { NSSound.beep(); return }       // 先选一边
         switch tool {
+        case .split where pts.count >= 2:
+            if let sd = splitSides(pts) {
+                sides = sd
+                splitLine = extendLine(pts)
+                sideNames = sd.map(sideLabel)
+            } else { NSSound.beep() }
         case .polygon where pts.count >= 3: commit(.polygon(pts.map(rel)))
         case .line where pts.count >= 2: commit(.stroke(pts.map(rel), width: lineWidth / W))
         default: if !pts.isEmpty { NSSound.beep() }
@@ -916,12 +966,14 @@ final class EditorView: NSView {
     }
 
     private func setTool(_ t: EditorTool) {
+        clearSplit()
         if !pts.isEmpty { finish() }
         state.tool = t
         sync(); refocus()
     }
 
     private func undo() {
+        if choosing { clearSplit(); sync(); refocus(); return }
         if !pts.isEmpty { pts.removeLast() } else if let s = undoStack.popLast() { shapes = s }
         sync(); refocus()
     }
@@ -934,17 +986,114 @@ final class EditorView: NSView {
     }
 
     private func save() {
+        if choosing { NSSound.beep(); return }       // 还没选边
+        if tool == .split && pts.count >= 2 { finish(); return }
         if drawing { finish() }
         onFinish?(shapes)
     }
 
+    private func clearSplit() { sides = []; sideNames = []; splitLine = [] }
+
+    private func choose(_ i: Int) {
+        guard sides.indices.contains(i) else { return }
+        commit(.polygon(sides[i].map(rel)))
+        clearSplit()
+        sync(); refocus()
+    }
+
     private func cancel() {
+        if choosing { clearSplit(); sync(); refocus(); return }
         if drawing { pts.removeAll(); dragRect = nil; dragStart = nil; sync(); refocus() } else { onFinish?(nil) }
     }
 
     private func nextScreen() {
+        clearSplit()
         if drawing { finish() }
         onNextScreen?(shapes)
+    }
+
+    // MARK: 分割几何（视图坐标，左上原点）
+
+    private func onBorder(_ p: CGPoint) -> Bool { p.x <= 0.5 || p.y <= 0.5 || p.x >= W - 0.5 || p.y >= H - 0.5 }
+
+    /// 从 p 沿 (dx, dy) 射到屏幕边框
+    private func ray(_ p: CGPoint, _ dx: CGFloat, _ dy: CGFloat) -> CGPoint {
+        var t = CGFloat.greatestFiniteMagnitude
+        if dx > 0 { t = min(t, (W - p.x) / dx) } else if dx < 0 { t = min(t, -p.x / dx) }
+        if dy > 0 { t = min(t, (H - p.y) / dy) } else if dy < 0 { t = min(t, -p.y / dy) }
+        guard t < .greatestFiniteMagnitude else { return p }
+        return CGPoint(x: min(max(p.x + dx * t, 0), W), y: min(max(p.y + dy * t, 0), H))
+    }
+
+    /// 两端顺着线的方向延伸到屏幕边缘
+    private func extendLine(_ pts: [CGPoint]) -> [CGPoint] {
+        guard pts.count >= 2 else { return pts }
+        func far(_ seq: [CGPoint]) -> CGPoint { seq.dropFirst().first { dist($0, seq[0]) > 40 } ?? seq[1] }
+        var out = pts
+        if !onBorder(pts[0]) { let f = far(pts); out.insert(ray(pts[0], pts[0].x - f.x, pts[0].y - f.y), at: 0) }
+        let rev = Array(pts.reversed())
+        if !onBorder(rev[0]) { let f = far(rev); out.append(ray(rev[0], rev[0].x - f.x, rev[0].y - f.y)) }
+        return out
+    }
+
+    /// 边框上的点 -> 顺时针周长参数（从左上角开始）
+    private func perimeterT(_ p: CGPoint) -> CGFloat {
+        if p.y <= 0.5 { return p.x }
+        if p.x >= W - 0.5 { return W + p.y }
+        if p.y >= H - 0.5 { return W + H + (W - p.x) }
+        return 2 * W + H + (H - p.y)
+    }
+
+    private func corners(from t0: CGFloat, to t1: CGFloat, clockwise: Bool) -> [CGPoint] {
+        let P = 2 * (W + H)
+        let cs: [(CGFloat, CGPoint)] = [(0, CGPoint(x: 0, y: 0)), (W, CGPoint(x: W, y: 0)),
+                                        (W + H, CGPoint(x: W, y: H)), (2 * W + H, CGPoint(x: 0, y: H))]
+        func mod(_ v: CGFloat) -> CGFloat { (v.truncatingRemainder(dividingBy: P) + P).truncatingRemainder(dividingBy: P) }
+        let total = clockwise ? mod(t1 - t0) : mod(t0 - t1)
+        return cs.compactMap { (t, pt) -> (CGFloat, CGPoint)? in
+            let r = clockwise ? mod(t - t0) : mod(t0 - t)
+            return r > 0 && r < total ? (r, pt) : nil
+        }
+        .sorted { $0.0 < $1.0 }
+        .map { $0.1 }
+    }
+
+    private func polyArea(_ p: [CGPoint]) -> CGFloat {
+        guard p.count > 2 else { return 0 }
+        var a: CGFloat = 0
+        for i in 0..<p.count { let q = p[(i + 1) % p.count]; a += p[i].x * q.y - q.x * p[i].y }
+        return abs(a) / 2
+    }
+
+    /// 用分界线把屏幕切成两边
+    private func splitSides(_ pts: [CGPoint]) -> [[CGPoint]]? {
+        let full = extendLine(pts)
+        guard full.count >= 2, onBorder(full.first!), onBorder(full.last!) else { return nil }
+        let t0 = perimeterT(full.last!), t1 = perimeterT(full.first!)
+        let a = full + corners(from: t0, to: t1, clockwise: true)
+        let b = full + corners(from: t0, to: t1, clockwise: false)
+        guard polyArea(a) > 100, polyArea(b) > 100 else { return nil }
+        return [a, b]
+    }
+
+    /// 按重心位置给一边起名：右上方 · 29.9%
+    private func sideLabel(_ p: [CGPoint]) -> String {
+        var a: CGFloat = 0, cx: CGFloat = 0, cy: CGFloat = 0
+        for i in 0..<p.count {
+            let q = p[(i + 1) % p.count], cr = p[i].x * q.y - q.x * p[i].y
+            a += cr; cx += (p[i].x + q.x) * cr; cy += (p[i].y + q.y) * cr
+        }
+        let c = abs(a) > 0.01 ? CGPoint(x: cx / (3 * a), y: cy / (3 * a)) : p[0]
+        let dx = (c.x - W / 2) / W, dy = (c.y - H / 2) / H
+        let h = dx < -0.03 ? "左" : dx > 0.03 ? "右" : ""
+        let v = dy < -0.03 ? "上" : dy > 0.03 ? "下" : ""
+        let name: String
+        switch (h.isEmpty, v.isEmpty) {
+        case (true, true): name = "中间"
+        case (false, true): name = h + "侧"
+        default: name = h + v + "方"
+        }
+        return "\(name) · \(pct(Double(polyArea(p) / (W * H))))"
     }
 
     private func shapeIndex(at p: CGPoint) -> Int? {
@@ -955,11 +1104,17 @@ final class EditorView: NSView {
 
     override func mouseDown(with e: NSEvent) {
         refocus()
+        if choosing {
+            // 选边模式：点哪边就把哪边设为坏区
+            let q = loc(e)
+            if let i = sides.firstIndex(where: { CGPath.poly($0).contains(q) }) { choose(i) }
+            return
+        }
         let p = snap(loc(e))
         switch tool {
         case .rect:
             dragStart = p
-        case .polygon, .line:
+        case .polygon, .line, .split:
             if e.clickCount >= 2 { finish(); return }
             pts.append(p)
         }
@@ -974,7 +1129,8 @@ final class EditorView: NSView {
             if let s = dragStart {
                 dragRect = CGRect(x: min(s.x, p.x), y: min(s.y, p.y), width: abs(p.x - s.x), height: abs(p.y - s.y))
             }
-        case .polygon, .line:
+        case .polygon, .line, .split:
+            if choosing { break }
             // 按住拖动 = 自由描边
             if let last = pts.last, dist(last, p) > 6 { pts.append(p) }
         }
@@ -991,6 +1147,7 @@ final class EditorView: NSView {
     }
 
     override func rightMouseDown(with e: NSEvent) {
+        if choosing { return }
         if !pts.isEmpty { finish(); return }
         // 没在画的时候，右键删除鼠标下的坏区
         if let i = shapeIndex(at: loc(e)) {
@@ -1002,6 +1159,10 @@ final class EditorView: NSView {
 
     override func mouseMoved(with e: NSEvent) {
         cursor = loc(e)
+        if choosing, let c = cursor, !toolbar.frame.contains(c) {
+            let i = sides.firstIndex { CGPath.poly($0).contains(c) }
+            if state.hoverSide != i { state.hoverSide = i }
+        }
         needsDisplay = true
     }
 
@@ -1025,9 +1186,10 @@ final class EditorView: NSView {
         }
         if cmd && chars == "z" { undo(); return }
         switch chars {
-        case "1", "p": setTool(.polygon)
-        case "2", "r": setTool(.rect)
-        case "3", "l": setTool(.line)
+        case "1", "s": setTool(.split)
+        case "2", "p": setTool(.polygon)
+        case "3", "r": setTool(.rect)
+        case "4", "l": setTool(.line)
         case "[": state.lineWidth = max(2, lineWidth - (lineWidth > 20 ? 4 : 1)); needsDisplay = true
         case "]": state.lineWidth = min(120, lineWidth + (lineWidth >= 20 ? 4 : 1)); needsDisplay = true
         case "h": toolbar.isHidden.toggle()
@@ -1060,6 +1222,44 @@ final class EditorView: NSView {
             c.setStrokeColor(i == hover ? NSColor.white.cgColor : NSColor.systemRed.cgColor)
             c.setLineWidth(i == hover ? 2.5 : 1.5)
             c.strokePath()
+        }
+
+        // 分割：选边预览
+        if choosing {
+            for (i, sd) in sides.enumerated() {
+                let p = CGPath.poly(sd)
+                let hot = state.hoverSide == i
+                c.addPath(p)
+                c.setFillColor((hot ? NSColor.systemRed.withAlphaComponent(0.6) : NSColor.white.withAlphaComponent(0.06)).cgColor)
+                c.fillPath()
+                // 在这一边的中间写上名字
+                let r = p.boundingBoxOfPath
+                let label = (hot ? "设为坏区：" : "") + sideNames[i]
+                let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 22, weight: .bold),
+                                                            .foregroundColor: NSColor.white.withAlphaComponent(hot ? 1 : 0.7)]
+                var at = CGPoint(x: r.midX, y: r.midY)
+                if !p.contains(at) { at = sd.reduce(.zero) { CGPoint(x: $0.x + $1.x / CGFloat(sd.count), y: $0.y + $1.y / CGFloat(sd.count)) } }
+                let sz = (label as NSString).size(withAttributes: attrs)
+                (label as NSString).draw(at: CGPoint(x: at.x - sz.width / 2, y: at.y - sz.height / 2), withAttributes: attrs)
+            }
+            let l = CGMutablePath(); l.addLines(between: splitLine)
+            c.addPath(l); c.setStrokeColor(NSColor.systemYellow.cgColor); c.setLineWidth(3); c.strokePath()
+        }
+
+        // 分割：画线时预览延伸部分
+        if tool == .split, !choosing {
+            var live = pts
+            if let cur = cursor, !pts.isEmpty, !overToolbar { live.append(snap(cur)) }
+            if live.count >= 2 {
+                let full = extendLine(live)
+                let ext = CGMutablePath(); ext.addLines(between: full)
+                c.saveGState()
+                c.addPath(ext); c.setStrokeColor(NSColor.white.withAlphaComponent(0.8).cgColor)
+                c.setLineWidth(1.5); c.setLineDash(phase: 0, lengths: [6, 5]); c.strokePath()
+                c.restoreGState()
+                let l = CGMutablePath(); l.addLines(between: live)
+                c.addPath(l); c.setStrokeColor(NSColor.systemYellow.cgColor); c.setLineWidth(3); c.strokePath()
+            }
         }
 
         // 正在画的形状
