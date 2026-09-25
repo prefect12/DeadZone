@@ -5,6 +5,7 @@
 import Cocoa
 import ApplicationServices
 import ServiceManagement
+import SwiftUI
 
 // MARK: - 坐标工具
 
@@ -210,6 +211,9 @@ struct DeadZone {
     let edges: [[(CGPoint, CGPoint)]]       // 每个形状的轮廓线段
     let rects: [CGRect]                     // 窗口避让用的栅格矩形
     let bounds: CGRect                      // 所有形状在屏幕内的外接矩形
+    let damage: Double                      // 损坏面积占整块屏幕的比例 0...1
+    let shapeCount: Int
+    let hasLine: Bool
     var visibleFrame: CGRect { toCG(screen.visibleFrame) }
 
     func contains(_ p: CGPoint) -> Bool { bounds.contains(p) && paths.contains { $0.contains(p) } }
@@ -270,8 +274,11 @@ enum Store {
             let paths = shapes.map { $0.path(in: f) }
             let solid = zip(shapes, paths).filter { !(windowsCrossThin && $0.0.isThin(in: f)) }.map { $0.1 }
             let bounds = paths.reduce(CGRect.null) { $0.union($1.boundingBoxOfPath) }.intersection(f)
+            let area = rasterize(paths, frame: f).reduce(0) { $0 + $1.width * $1.height }
+            let hasLine = shapes.contains { if case .stroke = $0 { return true } else { return false } }
             return DeadZone(screen: s, screenFrame: f, paths: paths, edges: paths.map(flatten),
-                            rects: rasterize(solid, frame: f), bounds: bounds)
+                            rects: rasterize(solid, frame: f), bounds: bounds,
+                            damage: Double(area / (f.width * f.height)), shapeCount: shapes.count, hasLine: hasLine)
         }
     }
 
@@ -350,6 +357,8 @@ final class WindowAvoider {
     private let minW: CGFloat = 240, minH: CGFloat = 160
     /// 记录挪不动的窗口，避免反复拉扯：窗口 hash -> (上次看到的位置, 尝试次数)
     private var attempts: [CFHashCode: (CGRect, Int)] = [:]
+    /// 被推开的窗口次数（成就统计用，主线程读取后清零）
+    var moves = 0
     /// 刚被我们退出全屏的窗口，等动画结束后放到"最大可用矩形"
     private var pendingMax: [(win: AXUIElement, since: Date)] = []
 
@@ -456,6 +465,7 @@ final class WindowAvoider {
 
             guard let target = plan(frame, dead: all, screen: S) ?? maxRect(dead: all, screen: S) else { continue }
             setFrame(win, target)
+            moves += 1
             let after = frameOf(win) ?? target
             let n = (attempts[key]?.0 == frame ? attempts[key]!.1 : 0) + 1
             attempts[key] = (after, n)
@@ -537,6 +547,11 @@ final class MouseGuard {
     private var _screens: [CGRect] = []
     private var lastGood: CGPoint?
     private let jumpMax: CGFloat = 48           // 小于这个厚度的坏区直接跳过
+    private var wasBlocked = false
+    private var _blocks = 0                     // 撞墙次数（成就统计用）
+
+    /// 取走累计的撞墙次数
+    func takeBlocks() -> Int { lock.lock(); defer { _blocks = 0; lock.unlock() }; return _blocks }
 
     func update(zones: [DeadZone], screens: [CGRect]) {
         lock.lock(); _zones = zones; _screens = screens; lock.unlock()
@@ -590,7 +605,9 @@ final class MouseGuard {
         }
         let (zones, screens) = snapshot()
         let p = e.location
-        guard let z = zones.first(where: { $0.contains(p) }) else { lastGood = p; return }
+        guard let z = zones.first(where: { $0.contains(p) }) else { lastGood = p; wasBlocked = false; return }
+        if !wasBlocked { lock.lock(); _blocks += 1; lock.unlock() }
+        wasBlocked = true
 
         func valid(_ q: CGPoint) -> Bool {
             screens.contains { $0.contains(q) } && !zones.contains { $0.contains(q) }
@@ -658,6 +675,8 @@ final class EditorView: NSView {
 
     var shapes: [Shape]
     var onFinish: (([Shape]?) -> Void)?
+    var onNextScreen: (([Shape]) -> Void)?      // Tab：保存并切到下一块屏幕
+    var screenLabel = ""
 
     private var tool: Tool = .polygon
     private var pts: [CGPoint] = []            // 正在画的点（视图坐标，左上原点）
@@ -789,6 +808,10 @@ final class EditorView: NSView {
         case 36, 76:                                            // 回车
             if drawing { finish() } else { onFinish?(shapes) }
             return
+        case 48:                                                // Tab
+            if drawing { finish() }
+            onNextScreen?(shapes)
+            return
         case 53:                                                // Esc
             if drawing { pts.removeAll(); dragRect = nil; dragStart = nil; needsDisplay = true } else { onFinish?(nil) }
             return
@@ -894,10 +917,11 @@ final class EditorView: NSView {
             body = "用于一条坏线（竖线、横线、裂纹）：沿线点击，两端点在屏幕边缘即可贯穿\n宽度 \(Int(lineWidth))pt（滚轮 或 [ ] 调整） · 双击 / 回车 / 右键：完成"
         }
         return """
+        正在编辑：\(screenLabel)
         \(head)
         \(body)
         右键点已有坏区：删除 · ⌘Z 撤销 · Delete 删上一个点 · ⌘Delete 全部清空 · H 隐藏说明
-        没在画时：回车 保存并退出 · Esc 放弃修改
+        没在画时：回车 保存并退出 · Esc 放弃修改 · Tab 保存并切换到下一块屏幕
         """ as NSString
     }
 
@@ -925,6 +949,7 @@ final class Editor {
     private var window: NSWindow?
 
     func open(screen: NSScreen, done: @escaping () -> Void) {
+        window?.orderOut(nil)
         let f = screen.frame
         let w = KeyableWindow(contentRect: f, styleMask: .borderless, backing: .buffered, defer: false)
         w.setFrame(f, display: false)
@@ -935,12 +960,23 @@ final class Editor {
         w.isReleasedWhenClosed = false
         w.acceptsMouseMovedEvents = true
 
+        let screens = NSScreen.screens
+        let idx = screens.firstIndex(of: screen) ?? 0
         let v = EditorView(frame: NSRect(origin: .zero, size: f.size), shapes: Store.shapes(for: screen))
+        v.screenLabel = "\(screen.localizedName)（\(idx + 1)/\(screens.count)）"
         v.onFinish = { [weak self] s in
             if let s { Store.set(s, for: screen) }
             self?.window?.orderOut(nil)
             self?.window = nil
             done()
+        }
+        v.onNextScreen = { [weak self] s in
+            Store.set(s, for: screen)
+            let next = screens[(idx + 1) % screens.count]
+            // 把鼠标带到下一块屏幕中央，方便直接开画
+            let nf = toCG(next.frame)
+            CGWarpMouseCursorPosition(CGPoint(x: nf.midX, y: nf.midY))
+            self?.open(screen: next, done: done)
         }
         w.contentView = v
         window = w
@@ -978,6 +1014,429 @@ func makeStatusIcon() -> NSImage {
     return img
 }
 
+// MARK: - 段位（按损坏面积）
+
+struct Tier {
+    let min: Double, emoji: String, name: String, comment: String
+
+    static let all: [Tier] = [
+        Tier(min: 0.00, emoji: "🔍", name: "坏点而已", comment: "这点坏，不仔细看都发现不了"),
+        Tier(min: 0.05, emoji: "💧", name: "洒洒水啦", comment: "小场面，照用不误"),
+        Tier(min: 0.15, emoji: "🩹", name: "小伤不下火线", comment: "轻伤不下火线，屏幕也一样"),
+        Tier(min: 0.30, emoji: "💪", name: "身残志坚", comment: "残缺的屏幕，完整的生产力"),
+        Tier(min: 0.50, emoji: "🏯", name: "半壁江山", comment: "坏了一半，还剩一半"),
+        Tier(min: 0.70, emoji: "🧮", name: "勤俭持家小能手", comment: "能用就不换，你是懂过日子的"),
+        Tier(min: 0.90, emoji: "🪦", name: "这就别用了吧", comment: "求求了，换一块吧"),
+    ]
+
+    static func of(_ damage: Double) -> Tier { all.last { damage >= $0.min } ?? all[0] }
+}
+
+// MARK: - 全球排名估算（仅供娱乐）
+// 总体：屏幕坏了还在继续用的人。依据公开调查的粗略量级：
+//  - 约 18% 的美国人正在用碎屏手机，碎屏后约 34% 选择继续用（YouGov）
+//  - 约 20–30% 的显示器至少有一个坏点，ISO 13406-2 Class II 允许少量坏点
+// 由此假设：坚持用坏屏的人里绝大多数只是坏点/小裂纹，大面积坏区极少。
+// 下面的锚点是基于这些量级的主观估计，在 log(损坏面积) 上线性插值。
+
+enum Ranking {
+    /// (损坏面积, 超过的坏屏用户比例)
+    static let anchors: [(Double, Double)] = [
+        (0.0001, 0.40),   // 0.01%：几个坏点
+        (0.001, 0.55),
+        (0.01, 0.70),     // 1%：一道小裂纹
+        (0.05, 0.85),
+        (0.15, 0.93),
+        (0.30, 0.97),
+        (0.50, 0.990),
+        (0.70, 0.997),
+        (0.90, 0.9995),
+        (1.00, 0.9999),
+    ]
+
+    /// 你的损坏程度超过了百分之多少的"坚持用坏屏"的人
+    static func percentile(_ d: Double) -> Double {
+        guard d > anchors[0].0 else { return d <= 0 ? 0 : anchors[0].1 * max(0, log10(d * 1e6)) / 2 }
+        for i in 1..<anchors.count where d <= anchors[i].0 {
+            let (x0, y0) = anchors[i - 1], (x1, y1) = anchors[i]
+            let k = (log10(d) - log10(x0)) / (log10(x1) - log10(x0))
+            return y0 + (y1 - y0) * k
+        }
+        return anchors.last!.1
+    }
+
+    static func beat(_ d: Double) -> String {
+        let p = percentile(d)
+        return "超过全球约 " + (p >= 0.999 ? String(format: "%.2f%%", p * 100) : String(format: "%.1f%%", p * 100)) + " 的坏屏坚持者"
+    }
+
+    static func oneIn(_ d: Double) -> String? {
+        let n = 1 / max(1 - percentile(d), 0.0001)
+        return n >= 10 ? "约 \(Int(n.rounded())) 人里才有 1 个比你更狠" : nil
+    }
+
+    static func text(_ d: Double) -> String { [beat(d), oneIn(d)].compactMap { $0 }.joined(separator: " · ") }
+}
+
+// MARK: - 成就
+
+struct Metrics {
+    var days = 0
+    var maxDamage = 0.0
+    var maxShapes = 0
+    var hasLine = false
+    var brokenScreens = 0
+    var blocks = 0
+    var moves = 0
+}
+
+struct Achievement: Identifiable {
+    let id: String, emoji: String, title: String, desc: String
+    let check: (Metrics) -> Bool
+
+    static let all: [Achievement] = [
+        Achievement(id: "d1", emoji: "🌱", title: "初来乍到", desc: "第一次标记坏区") { $0.days >= 1 },
+        Achievement(id: "d3", emoji: "🔧", title: "将就着用", desc: "用坏屏幕 3 天") { $0.days >= 3 },
+        Achievement(id: "d7", emoji: "📅", title: "坚持一周", desc: "用坏屏幕 7 天") { $0.days >= 7 },
+        Achievement(id: "d10", emoji: "🏅", title: "你真是个人才", desc: "用坏屏幕 10 天") { $0.days >= 10 },
+        Achievement(id: "d30", emoji: "🧱", title: "一个月了还没换？", desc: "用坏屏幕 30 天") { $0.days >= 30 },
+        Achievement(id: "d100", emoji: "💯", title: "百日筑基", desc: "用坏屏幕 100 天") { $0.days >= 100 },
+        Achievement(id: "d365", emoji: "👑", title: "年度钉子户", desc: "用坏屏幕 365 天") { $0.days >= 365 },
+
+        Achievement(id: "a5", emoji: "💧", title: "洒洒水啦", desc: "屏幕损坏面积达到 5%") { $0.maxDamage >= 0.05 },
+        Achievement(id: "a30", emoji: "💪", title: "身残志坚", desc: "屏幕损坏面积达到 30%") { $0.maxDamage >= 0.30 },
+        Achievement(id: "a50", emoji: "🏯", title: "半壁江山", desc: "屏幕损坏面积达到 50%") { $0.maxDamage >= 0.50 },
+        Achievement(id: "a70", emoji: "🧮", title: "勤俭持家小能手", desc: "屏幕损坏面积达到 70%") { $0.maxDamage >= 0.70 },
+        Achievement(id: "a90", emoji: "🪦", title: "这就别用了吧", desc: "屏幕损坏面积达到 90%") { $0.maxDamage >= 0.90 },
+
+        Achievement(id: "shapes5", emoji: "🧩", title: "精雕细琢", desc: "一块屏幕上标记 5 块以上坏区") { $0.maxShapes >= 5 },
+        Achievement(id: "line", emoji: "📏", title: "一线之隔", desc: "标记一条坏线") { $0.hasLine },
+        Achievement(id: "multi", emoji: "🖥️", title: "难兄难弟", desc: "两块以上屏幕都有坏区") { $0.brokenScreens >= 2 },
+        Achievement(id: "block100", emoji: "🚧", title: "此路不通", desc: "鼠标撞墙 100 次") { $0.blocks >= 100 },
+        Achievement(id: "block10k", emoji: "🐂", title: "撞了南墙也不回头", desc: "鼠标撞墙 10000 次") { $0.blocks >= 10_000 },
+        Achievement(id: "move100", emoji: "📦", title: "窗口搬运工", desc: "窗口被推开 100 次") { $0.moves >= 100 },
+    ]
+}
+
+// MARK: - 统计（本地保存，不联网）
+
+enum Stats {
+    static var d: UserDefaults { .standard }
+
+    static var days: [String] { d.stringArray(forKey: "statsDays") ?? [] }
+    static var blocks: Int { d.integer(forKey: "statsBlocks") }
+    static var moves: Int { d.integer(forKey: "statsMoves") }
+    static var unlocked: [String: Double] { d.dictionary(forKey: "achievements") as? [String: Double] ?? [:] }
+
+    static func markToday() {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"
+        let today = f.string(from: Date())
+        var list = days
+        if !list.contains(today) { list.append(today); d.set(list, forKey: "statsDays") }
+    }
+    static func add(blocks n: Int) { if n > 0 { d.set(blocks + n, forKey: "statsBlocks") } }
+    static func add(moves n: Int) { if n > 0 { d.set(moves + n, forKey: "statsMoves") } }
+
+    static func metrics(_ zones: [DeadZone]) -> Metrics {
+        Metrics(days: days.count, maxDamage: zones.map(\.damage).max() ?? 0,
+                maxShapes: zones.map(\.shapeCount).max() ?? 0, hasLine: zones.contains { $0.hasLine },
+                brokenScreens: zones.count, blocks: blocks, moves: moves)
+    }
+
+    /// 检查新解锁的成就，写入并返回
+    static func unlockNew(_ m: Metrics) -> [Achievement] {
+        var u = unlocked
+        let fresh = Achievement.all.filter { u[$0.id] == nil && $0.check(m) }
+        guard !fresh.isEmpty else { return [] }
+        for a in fresh { u[a.id] = Date().timeIntervalSince1970 }
+        d.set(u, forKey: "achievements")
+        return fresh
+    }
+}
+
+// MARK: - 成就解锁提示（避开坏区显示）
+
+struct ToastView: View {
+    let a: Achievement
+    var body: some View {
+        HStack(spacing: 14) {
+            Text(a.emoji).font(.system(size: 38))
+            VStack(alignment: .leading, spacing: 3) {
+                Text("解锁成就").font(.caption).foregroundStyle(.secondary)
+                Text(a.title).font(.title3.bold())
+                Text(a.desc).font(.callout).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 20).padding(.vertical, 14)
+        .frame(width: 340)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(Color.yellow.opacity(0.6), lineWidth: 1.5))
+    }
+}
+
+final class Toaster {
+    private var queue: [Achievement] = []
+    private var panel: NSPanel?
+    var zones: () -> [DeadZone] = { [] }
+
+    func show(_ list: [Achievement]) {
+        queue += list
+        if panel == nil { next() }
+    }
+
+    private func next() {
+        guard !queue.isEmpty else { panel = nil; return }
+        let a = queue.removeFirst()
+        let host = NSHostingView(rootView: ToastView(a: a))
+        let size = host.fittingSize
+        let p = NSPanel(contentRect: NSRect(origin: .zero, size: size), styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: false)
+        p.isOpaque = false; p.backgroundColor = .clear; p.hasShadow = true
+        p.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.screenSaverWindow)) + 2)
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        p.ignoresMouseEvents = true
+        p.contentView = host
+        p.setFrameOrigin(position(for: size))
+        p.alphaValue = 0
+        p.orderFrontRegardless()
+        panel = p
+        NSAnimationContext.runAnimationGroup { $0.duration = 0.3; p.animator().alphaValue = 1 }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) { [weak self] in
+            NSAnimationContext.runAnimationGroup({ $0.duration = 0.4; p.animator().alphaValue = 0 }) {
+                p.orderOut(nil)
+                self?.next()
+            }
+        }
+    }
+
+    /// 鼠标所在屏幕的顶部中间 / 底部中间 / 正中，取第一个不压坏区的位置
+    private func position(for size: NSSize) -> NSPoint {
+        let m = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { NSMouseInRect(m, $0.frame, false) } ?? NSScreen.main!
+        let v = screen.visibleFrame
+        let spots = [NSPoint(x: v.midX - size.width / 2, y: v.maxY - size.height - 24),
+                     NSPoint(x: v.midX - size.width / 2, y: v.minY + 24),
+                     NSPoint(x: v.midX - size.width / 2, y: v.midY - size.height / 2),
+                     NSPoint(x: v.minX + 24, y: v.minY + 24)]
+        let dead = zones().flatMap(\.paths)
+        return spots.first { o in
+            let r = toCG(NSRect(origin: o, size: size))
+            return !dead.contains { $0.boundingBoxOfPath.intersects(r) && pathIntersects($0, r) }
+        } ?? spots[0]
+    }
+
+    private func pathIntersects(_ p: CGPath, _ r: CGRect) -> Bool {
+        let rp = CGPath(rect: r, transform: nil)
+        return !p.intersection(rp).isEmpty
+    }
+}
+
+// MARK: - 成就与战绩窗口
+
+struct ScreenReport: Identifiable {
+    let id: String, name: String, damage: Double, shapes: Int
+}
+
+struct Report {
+    var screens: [ScreenReport]
+    var days: Int, blocks: Int, moves: Int
+    var unlocked: [String: Double]
+
+    static func current(_ zones: [DeadZone]) -> Report {
+        Report(screens: zones.map { ScreenReport(id: $0.screen.uuid, name: $0.screen.localizedName,
+                                                 damage: $0.damage, shapes: $0.shapeCount) },
+               days: Stats.days.count, blocks: Stats.blocks, moves: Stats.moves, unlocked: Stats.unlocked)
+    }
+    var worst: ScreenReport? { screens.max { $0.damage < $1.damage } }
+}
+
+func pct(_ v: Double) -> String { String(format: v > 0 && v < 0.001 ? "%.2f%%" : "%.1f%%", v * 100) }
+
+struct TierLadder: View {
+    let damage: Double
+    var body: some View {
+        let cur = Tier.of(damage)
+        HStack(spacing: 4) {
+            ForEach(Tier.all, id: \.name) { t in
+                VStack(spacing: 4) {
+                    Text(t.emoji).font(.system(size: t.name == cur.name ? 22 : 15))
+                        .opacity(t.min <= damage ? 1 : 0.3)
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(t.name == cur.name ? Color.red : (t.min <= damage ? Color.red.opacity(0.4) : Color.secondary.opacity(0.2)))
+                        .frame(height: 5)
+                }
+                .frame(maxWidth: .infinity)
+                .help("\(t.name)（≥ \(Int(t.min * 100))%）")
+            }
+        }
+    }
+}
+
+struct DamageCard: View {
+    let s: ScreenReport
+    var body: some View {
+        let t = Tier.of(s.damage)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(s.name).font(.headline)
+                Spacer()
+                Text("\(s.shapes) 块坏区").font(.caption).foregroundStyle(.secondary)
+            }
+            HStack(alignment: .center, spacing: 16) {
+                Text(pct(s.damage)).font(.system(size: 44, weight: .bold, design: .rounded)).monospacedDigit()
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(t.emoji) \(t.name)").font(.title3.bold())
+                    Text(t.comment).font(.callout).foregroundStyle(.secondary)
+                }
+            }
+            TierLadder(damage: s.damage)
+            HStack(spacing: 6) {
+                Image(systemName: "globe.asia.australia")
+                Text(Ranking.text(s.damage))
+                Text("估算").font(.caption2).padding(.horizontal, 5).padding(.vertical, 1)
+                    .background(Color.secondary.opacity(0.15), in: Capsule())
+                    .help("根据公开调查的量级估算，仅供娱乐：约 18% 的美国人在用碎屏手机，碎屏后约 34% 继续使用；约 20–30% 的显示器有坏点。")
+            }
+            .font(.callout).foregroundStyle(.secondary)
+        }
+        .padding(16)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 14))
+    }
+}
+
+struct StatTile: View {
+    let label: String, value: String
+    var body: some View {
+        VStack(spacing: 4) {
+            Text(value).font(.system(size: 22, weight: .semibold, design: .rounded)).monospacedDigit()
+            Text(label).font(.caption).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity).padding(.vertical, 12)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+struct BadgeView: View {
+    let a: Achievement, date: Double?
+    var body: some View {
+        let on = date != nil
+        HStack(spacing: 10) {
+            Text(a.emoji).font(.system(size: 26)).grayscale(on ? 0 : 1).opacity(on ? 1 : 0.35)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(a.title).font(.callout.bold()).foregroundStyle(on ? .primary : .secondary)
+                Text(on ? Date(timeIntervalSince1970: date!).formatted(date: .abbreviated, time: .omitted) : a.desc)
+                    .font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .background(on ? Color.yellow.opacity(0.12) : Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
+        .help(a.desc)
+    }
+}
+
+/// 用来分享的战绩卡片
+struct ShareCard: View {
+    let r: Report
+    var body: some View {
+        let w = r.worst
+        let t = Tier.of(w?.damage ?? 0)
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("DeadZone 坏屏战绩").font(.system(size: 15, weight: .semibold)).foregroundStyle(.white.opacity(0.8))
+                Spacer()
+                Text("🏆 \(r.unlocked.count)/\(Achievement.all.count)").font(.system(size: 14, weight: .semibold)).foregroundStyle(.white)
+            }
+            HStack(alignment: .center, spacing: 18) {
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("屏幕损坏面积").font(.system(size: 12)).foregroundStyle(.white.opacity(0.7))
+                    Text(pct(w?.damage ?? 0)).font(.system(size: 52, weight: .heavy, design: .rounded)).foregroundStyle(.white)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("\(t.emoji) \(t.name)").font(.system(size: 22, weight: .bold)).foregroundStyle(.white)
+                    Text(t.comment).font(.system(size: 13)).foregroundStyle(.white.opacity(0.8))
+                }
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text("🌏 " + Ranking.beat(w?.damage ?? 0) + "（估算）")
+                    .font(.system(size: 14, weight: .semibold)).foregroundStyle(.white)
+                if let o = Ranking.oneIn(w?.damage ?? 0) {
+                    Text(o).font(.system(size: 13)).foregroundStyle(.white.opacity(0.85)).padding(.leading, 24)
+                }
+            }
+            Text("已坚持使用 \(r.days) 天 · 鼠标撞墙 \(r.blocks) 次 · 窗口被推开 \(r.moves) 次")
+                .font(.system(size: 13)).foregroundStyle(.white.opacity(0.85))
+            Text("github.com/prefect12/DeadZone").font(.system(size: 11, design: .monospaced)).foregroundStyle(.white.opacity(0.6))
+        }
+        .padding(24)
+        .frame(width: 440)
+        .background(LinearGradient(colors: [Color(red: 0.13, green: 0.18, blue: 0.29), Color(red: 0.36, green: 0.16, blue: 0.42)],
+                                   startPoint: .topLeading, endPoint: .bottomTrailing))
+    }
+}
+
+struct StatsView: View {
+    let report: Report
+    @State private var copied = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                if report.screens.isEmpty {
+                    Text("还没有标记坏区。标记之后，这里会显示你的损坏面积和段位。").foregroundStyle(.secondary)
+                }
+                ForEach(report.screens) { DamageCard(s: $0) }
+
+                HStack(spacing: 10) {
+                    StatTile(label: "坚持使用", value: "\(report.days) 天")
+                    StatTile(label: "鼠标撞墙", value: "\(report.blocks) 次")
+                    StatTile(label: "窗口被推开", value: "\(report.moves) 次")
+                }
+
+                HStack {
+                    Text("成就").font(.headline)
+                    Text("\(report.unlocked.count)/\(Achievement.all.count)").foregroundStyle(.secondary)
+                    Spacer()
+                    Button(copied ? "已复制到剪贴板 ✓" : "复制战绩卡片") { copyCard() }
+                }
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 160), spacing: 8)], spacing: 8) {
+                    ForEach(Achievement.all) { BadgeView(a: $0, date: report.unlocked[$0.id]) }
+                }
+                Text("所有统计只保存在本机，不联网。").font(.caption2).foregroundStyle(.tertiary)
+            }
+            .padding(22)
+        }
+        .frame(width: 580, height: 680)
+    }
+
+    private func copyCard() {
+        let renderer = ImageRenderer(content: ShareCard(r: report))
+        renderer.scale = 2
+        guard let img = renderer.nsImage else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.writeObjects([img])
+        copied = true
+    }
+}
+
+final class StatsWindow {
+    private var window: NSWindow?
+
+    func show(_ report: Report) {
+        let host = NSHostingView(rootView: StatsView(report: report))
+        let w = window ?? NSWindow(contentRect: NSRect(x: 0, y: 0, width: 580, height: 680),
+                                   styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+        w.title = "成就与战绩"
+        w.isReleasedWhenClosed = false
+        w.contentView = host
+        if window == nil { w.center() }
+        window = w
+        NSApp.activate(ignoringOtherApps: true)
+        w.makeKeyAndOrderFront(nil)
+    }
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -986,6 +1445,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let avoider = WindowAvoider()
     private let mouse = MouseGuard()
     private let editor = Editor()
+    private let toaster = Toaster()
+    private let statsWindow = StatsWindow()
+    private var ticks = 0
     private var timer: Timer?
     private var editing = false
     private var zones: [DeadZone] = []
@@ -996,7 +1458,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var windowsCrossThin: Bool { Store.bool("windowsCrossThin", default: false) }
 
     private var defaultEditScreen: NSScreen? {
-        NSScreen.screens.first(where: { CGDisplayIsBuiltin($0.displayID) == 0 }) ?? NSScreen.screens.last
+        let m = NSEvent.mouseLocation
+        return NSScreen.screens.first { NSMouseInRect(m, $0.frame, false) } ?? NSScreen.main
     }
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -1023,7 +1486,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // 刚授权时 tap 还没建起来，补建
             if trusted && !self.mouse.running && self.blockMouse && !self.editing && !self.zones.isEmpty { self.mouse.start() }
             self.tickWindows()
+            self.ticks += 1
+            if self.ticks % 20 == 0 { self.updateStats() }       // 每 5 秒
         }
+        toaster.zones = { [weak self] in self?.zones ?? [] }
         reload()
         if zones.isEmpty, let s = defaultEditScreen { startEditing(s) }
     }
@@ -1032,6 +1498,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !editing, let s = defaultEditScreen { startEditing(s) }
         return false
+    }
+
+    /// 汇总统计、检查成就
+    private func updateStats() {
+        Stats.add(blocks: mouse.takeBlocks())
+        Stats.add(moves: avoider.moves); avoider.moves = 0
+        guard !zones.isEmpty, !editing else { return }
+        Stats.markToday()
+        toaster.show(Stats.unlockNew(Stats.metrics(zones)))
     }
 
     private func tickWindows() {
@@ -1053,6 +1528,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         editor.open(screen: s) { [weak self] in
             self?.editing = false
             self?.reload()
+            self?.updateStats()
         }
     }
 
@@ -1084,6 +1560,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(editItem)
         menu.addItem(item("清除全部坏区", #selector(clearAll)))
         menu.addItem(.separator())
+        let worst = zones.map(\.damage).max()
+        let head = worst.map { "成就与战绩…  \(Tier.of($0).emoji) \(pct($0))" } ?? "成就与战绩…"
+        menu.addItem(item(head, #selector(showStats)))
+        menu.addItem(.separator())
 
         menu.addItem(toggle("黑色遮罩坏区", "showOverlay", showOverlay))
         menu.addItem(toggle("自动把窗口移出坏区", "avoidWindows", avoidWindows))
@@ -1109,6 +1589,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func editScreen(_ sender: NSMenuItem) {
         guard NSScreen.screens.indices.contains(sender.tag) else { return }
         startEditing(NSScreen.screens[sender.tag])
+    }
+    @objc func showStats() {
+        updateStats()
+        statsWindow.show(Report.current(zones))
     }
     @objc func clearAll() { Store.clearAll(); reload() }
     @objc func toggleSetting(_ sender: NSMenuItem) {
