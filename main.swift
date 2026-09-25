@@ -668,29 +668,178 @@ private func mouseTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: 
 // MARK: - 坏区编辑器
 // 坏区里常常什么都看不见，所以所有工具都是在"看得见的一侧"沿边缘操作；
 // 贯穿全屏的绿色十字线帮助判断鼠标进了黑区后的位置。
+// 屏幕上有一个浮动工具栏：切换工具、调线宽、撤销/清空、保存，并实时提示下一步该做什么。
+
+enum EditorTool: String, CaseIterable, Identifiable {
+    case polygon = "多边形", rect = "矩形", line = "线条"
+    var id: String { rawValue }
+    var icon: String {
+        switch self {
+        case .polygon: return "pentagon"
+        case .rect: return "rectangle"
+        case .line: return "line.diagonal"
+        }
+    }
+    var key: String {
+        switch self {
+        case .polygon: return "1"
+        case .rect: return "2"
+        case .line: return "3"
+        }
+    }
+    var usage: String {
+        switch self {
+        case .polygon: return "任意形状的斑块、角落"
+        case .rect: return "规整的矩形区域"
+        case .line: return "竖线、横线、裂纹"
+        }
+    }
+}
+
+/// 编辑器与工具栏共享的状态
+final class EditorState: ObservableObject {
+    @Published var tool: EditorTool = .polygon
+    @Published var lineWidth: CGFloat = 8
+    @Published var points = 0
+    @Published var dragging = false
+    @Published var shapeCount = 0
+    @Published var canUndo = false
+    @Published var screenLabel = ""
+    @Published var multiScreen = false
+
+    var drawing: Bool { points > 0 || dragging }
+
+    var step: (icon: String, text: String) {
+        switch tool {
+        case .polygon:
+            if points == 0 { return ("1.circle.fill", "在坏区边缘单击，放下第一个点（在看得见的一侧；也可以按住拖动描边）") }
+            if points < 3 { return ("2.circle.fill", "继续沿边缘单击，把坏区围起来 · 已放 \(points) 个点，至少要 3 个") }
+            return ("3.circle.fill", "双击 或 按回车，完成这一块 · 已放 \(points) 个点")
+        case .rect:
+            return dragging ? ("2.circle.fill", "松开鼠标完成这一块") : ("1.circle.fill", "按住鼠标，拖出一个盖住坏区的矩形")
+        case .line:
+            if points == 0 { return ("1.circle.fill", "在坏线的一端单击（点在屏幕边缘，线就会贯穿整块屏幕）") }
+            if points < 2 { return ("2.circle.fill", "在坏线的另一端单击") }
+            return ("3.circle.fill", "双击 或 按回车，完成这条线 · 可以继续点击画折线")
+        }
+    }
+
+    // 工具栏上的操作，由 EditorView 实现
+    var setTool: (EditorTool) -> Void = { _ in }
+    var undo: () -> Void = {}
+    var clear: () -> Void = {}
+    var finishShape: () -> Void = {}
+    var save: () -> Void = {}
+    var cancel: () -> Void = {}
+    var nextScreen: () -> Void = {}
+    var widthChanged: () -> Void = {}
+}
+
+struct EditorToolbar: View {
+    @ObservedObject var s: EditorState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Label("圈选坏区 · \(s.screenLabel)", systemImage: "display").font(.headline)
+                Spacer()
+                if s.multiScreen {
+                    Button { s.nextScreen() } label: { Label("下一块屏幕", systemImage: "arrow.right.to.line") }
+                        .help("保存当前屏幕，切换到下一块（Tab）")
+                }
+            }
+
+            HStack(spacing: 8) {
+                ForEach(EditorTool.allCases) { t in
+                    Button { s.setTool(t) } label: {
+                        VStack(spacing: 3) {
+                            Image(systemName: t.icon).font(.system(size: 18))
+                            Text(t.rawValue).font(.caption.bold())
+                        }
+                        .frame(width: 64, height: 46)
+                        .background(s.tool == t ? Color.accentColor : Color.primary.opacity(0.08),
+                                    in: RoundedRectangle(cornerRadius: 9))
+                        .foregroundStyle(s.tool == t ? Color.white : Color.primary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("\(t.rawValue)：\(t.usage)（快捷键 \(t.key)）")
+                }
+                if s.tool == .line {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("线宽 \(Int(s.lineWidth)) pt").font(.caption).monospacedDigit()
+                        Slider(value: Binding(get: { Double(s.lineWidth) },
+                                              set: { s.lineWidth = CGFloat($0); s.widthChanged() }), in: 2...120)
+                            .frame(width: 130)
+                    }
+                    .padding(.leading, 6)
+                } else {
+                    Text(s.tool.usage).font(.caption).foregroundStyle(.secondary).padding(.leading, 6)
+                }
+                Spacer(minLength: 8)
+                Button { s.undo() } label: { Image(systemName: "arrow.uturn.backward") }
+                    .disabled(!s.canUndo && !s.drawing).help("撤销（⌘Z）")
+                Button { s.clear() } label: { Image(systemName: "trash") }
+                    .disabled(s.shapeCount == 0 && !s.drawing).help("清空这块屏幕的全部坏区")
+            }
+
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: s.step.icon).font(.system(size: 18)).foregroundStyle(Color.yellow)
+                Text(s.step.text).font(.system(size: 14, weight: .medium)).fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.yellow.opacity(0.12), in: RoundedRectangle(cornerRadius: 9))
+
+            HStack {
+                Text(s.shapeCount == 0 ? "还没有圈选" : "已圈选 \(s.shapeCount) 块 · 右键点红色区域可删除")
+                    .font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("取消") { s.cancel() }.keyboardShortcut(.cancelAction)
+                if s.drawing && s.tool != .rect {
+                    Button("完成这一块") { s.finishShape() }
+                }
+                Button("保存并退出") { s.save() }.buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(16)
+        .frame(width: 600)
+        .background(Color(white: 0.11).opacity(0.97), in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(Color.white.opacity(0.15)))
+        .environment(\.colorScheme, .dark)
+    }
+}
 
 final class EditorView: NSView {
-    enum Tool: String { case polygon = "多边形", rect = "矩形", line = "线条" }
-
     var shapes: [Shape]
+    let state = EditorState()
     var onFinish: (([Shape]?) -> Void)?
     var onNextScreen: (([Shape]) -> Void)?      // Tab：保存并切到下一块屏幕
-    var screenLabel = ""
 
-    private var tool: Tool = .polygon
+    private var tool: EditorTool { state.tool }
+    private var lineWidth: CGFloat { state.lineWidth }
     private var pts: [CGPoint] = []            // 正在画的点（视图坐标，左上原点）
     private var dragStart: CGPoint?
     private var dragRect: CGRect?
-    private var lineWidth: CGFloat = 8          // 线条工具的宽度（pt）
     private var cursor: CGPoint?
-    private var undo: [[Shape]] = []
-    private var showTip = true
-    private var tipAtTop = false
+    private var undoStack: [[Shape]] = []
     private let snapDist: CGFloat = 16
+    private var toolbar: NSHostingView<EditorToolbar>!
 
     init(frame: NSRect, shapes: [Shape]) {
         self.shapes = shapes
         super.init(frame: frame)
+        state.setTool = { [weak self] t in self?.setTool(t) }
+        state.undo = { [weak self] in self?.undo() }
+        state.clear = { [weak self] in self?.clearAll() }
+        state.finishShape = { [weak self] in self?.finish() }
+        state.save = { [weak self] in self?.save() }
+        state.cancel = { [weak self] in self?.cancel() }
+        state.nextScreen = { [weak self] in self?.nextScreen() }
+        state.widthChanged = { [weak self] in self?.needsDisplay = true }
+
+        toolbar = NSHostingView(rootView: EditorToolbar(s: state))
+        addSubview(toolbar)
+        sync()
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -710,6 +859,35 @@ final class EditorView: NSView {
     private func rel(_ p: CGPoint) -> CGPoint { CGPoint(x: p.x / W, y: p.y / H) }
     private func loc(_ e: NSEvent) -> CGPoint { convert(e.locationInWindow, from: nil) }
 
+    /// 把状态同步给工具栏，并把工具栏放到不挡坏区的地方
+    private func sync() {
+        state.points = pts.count
+        state.dragging = dragRect != nil
+        state.shapeCount = shapes.count
+        state.canUndo = !undoStack.isEmpty
+        placeToolbar()
+        needsDisplay = true
+    }
+
+    private func placeToolbar() {
+        let size = toolbar.fittingSize
+        let paths = shapes.map { $0.path(in: bounds) }
+        let spots = [CGPoint(x: (W - size.width) / 2, y: H - size.height - 48),
+                     CGPoint(x: (W - size.width) / 2, y: 48),
+                     CGPoint(x: 48, y: H - size.height - 48),
+                     CGPoint(x: 48, y: 48),
+                     CGPoint(x: (W - size.width) / 2, y: (H - size.height) / 2)]
+        let pick = spots.first { o in
+            let r = CGRect(origin: o, size: size).insetBy(dx: -8, dy: -8)
+            let rp = CGPath(rect: r, transform: nil)
+            return !paths.contains { !$0.intersection(rp).isEmpty }
+        } ?? spots[0]
+        let frame = CGRect(origin: pick, size: size)
+        if toolbar.frame != frame { toolbar.frame = frame }
+    }
+
+    private func refocus() { window?.makeFirstResponder(self) }
+
     /// 靠近屏幕边缘时吸附到边上（靠近两条边就吸到角上）
     private func snap(_ p: CGPoint) -> CGPoint {
         var q = CGPoint(x: min(max(p.x, 0), W), y: min(max(p.y, 0), H))
@@ -720,8 +898,10 @@ final class EditorView: NSView {
         return q
     }
 
+    // MARK: 操作
+
     private func commit(_ s: Shape) {
-        undo.append(shapes)
+        undoStack.append(shapes)
         shapes.append(s)
     }
 
@@ -729,10 +909,42 @@ final class EditorView: NSView {
         switch tool {
         case .polygon where pts.count >= 3: commit(.polygon(pts.map(rel)))
         case .line where pts.count >= 2: commit(.stroke(pts.map(rel), width: lineWidth / W))
-        default: break
+        default: if !pts.isEmpty { NSSound.beep() }
         }
         pts.removeAll()
-        needsDisplay = true
+        sync(); refocus()
+    }
+
+    private func setTool(_ t: EditorTool) {
+        if !pts.isEmpty { finish() }
+        state.tool = t
+        sync(); refocus()
+    }
+
+    private func undo() {
+        if !pts.isEmpty { pts.removeLast() } else if let s = undoStack.popLast() { shapes = s }
+        sync(); refocus()
+    }
+
+    private func clearAll() {
+        guard !shapes.isEmpty || !pts.isEmpty else { return }
+        undoStack.append(shapes)
+        shapes.removeAll(); pts.removeAll()
+        sync(); refocus()
+    }
+
+    private func save() {
+        if drawing { finish() }
+        onFinish?(shapes)
+    }
+
+    private func cancel() {
+        if drawing { pts.removeAll(); dragRect = nil; dragStart = nil; sync(); refocus() } else { onFinish?(nil) }
+    }
+
+    private func nextScreen() {
+        if drawing { finish() }
+        onNextScreen?(shapes)
     }
 
     private func shapeIndex(at p: CGPoint) -> Int? {
@@ -742,6 +954,7 @@ final class EditorView: NSView {
     // MARK: 事件
 
     override func mouseDown(with e: NSEvent) {
+        refocus()
         let p = snap(loc(e))
         switch tool {
         case .rect:
@@ -750,7 +963,7 @@ final class EditorView: NSView {
             if e.clickCount >= 2 { finish(); return }
             pts.append(p)
         }
-        needsDisplay = true
+        sync()
     }
 
     override func mouseDragged(with e: NSEvent) {
@@ -765,7 +978,7 @@ final class EditorView: NSView {
             // 按住拖动 = 自由描边
             if let last = pts.last, dist(last, p) > 6 { pts.append(p) }
         }
-        needsDisplay = true
+        sync()
     }
 
     override func mouseUp(with e: NSEvent) {
@@ -774,29 +987,27 @@ final class EditorView: NSView {
                              CGPoint(x: r.maxX, y: r.maxY), CGPoint(x: r.minX, y: r.maxY)].map(rel)))
         }
         dragStart = nil; dragRect = nil
-        needsDisplay = true
+        sync()
     }
 
     override func rightMouseDown(with e: NSEvent) {
         if !pts.isEmpty { finish(); return }
         // 没在画的时候，右键删除鼠标下的坏区
         if let i = shapeIndex(at: loc(e)) {
-            undo.append(shapes)
+            undoStack.append(shapes)
             shapes.remove(at: i)
-            needsDisplay = true
+            sync()
         }
     }
 
     override func mouseMoved(with e: NSEvent) {
         cursor = loc(e)
-        // 说明框挡住鼠标就换到另一边
-        if showTip, let c = cursor, tipRect().insetBy(dx: -20, dy: -20).contains(c) { tipAtTop.toggle() }
         needsDisplay = true
     }
 
     override func scrollWheel(with e: NSEvent) {
         guard tool == .line else { return }
-        lineWidth = min(300, max(2, lineWidth + e.scrollingDeltaY * (e.hasPreciseScrollingDeltas ? 0.2 : 2)))
+        state.lineWidth = min(120, max(2, lineWidth + e.scrollingDeltaY * (e.hasPreciseScrollingDeltas ? 0.2 : 2)))
         needsDisplay = true
     }
 
@@ -804,43 +1015,24 @@ final class EditorView: NSView {
         let chars = (e.charactersIgnoringModifiers ?? "").lowercased()
         let cmd = e.modifierFlags.contains(.command)
         switch e.keyCode {
-        case 36, 76:                                            // 回车
-            if drawing { finish() } else { onFinish?(shapes) }
-            return
-        case 48:                                                // Tab
-            if drawing { finish() }
-            onNextScreen?(shapes)
-            return
-        case 53:                                                // Esc
-            if drawing { pts.removeAll(); dragRect = nil; dragStart = nil; needsDisplay = true } else { onFinish?(nil) }
-            return
-        case 51, 117:                                           // Delete
-            if cmd { undo.append(shapes); shapes.removeAll(); pts.removeAll() }
-            else if !pts.isEmpty { pts.removeLast() }
-            needsDisplay = true
+        case 36, 76: if drawing { finish() } else { save() }; return        // 回车
+        case 48: nextScreen(); return                                       // Tab
+        case 53: cancel(); return                                           // Esc
+        case 51, 117:                                                       // Delete
+            if cmd { clearAll() } else if !pts.isEmpty { pts.removeLast(); sync() }
             return
         default: break
         }
-        if cmd && chars == "z" {
-            if !pts.isEmpty { pts.removeLast() } else if let s = undo.popLast() { shapes = s }
-            needsDisplay = true
-            return
-        }
+        if cmd && chars == "z" { undo(); return }
         switch chars {
         case "1", "p": setTool(.polygon)
         case "2", "r": setTool(.rect)
         case "3", "l": setTool(.line)
-        case "[": lineWidth = max(2, lineWidth - (lineWidth > 20 ? 4 : 1)); needsDisplay = true
-        case "]": lineWidth = min(300, lineWidth + (lineWidth >= 20 ? 4 : 1)); needsDisplay = true
-        case "h": showTip.toggle(); needsDisplay = true
+        case "[": state.lineWidth = max(2, lineWidth - (lineWidth > 20 ? 4 : 1)); needsDisplay = true
+        case "]": state.lineWidth = min(120, lineWidth + (lineWidth >= 20 ? 4 : 1)); needsDisplay = true
+        case "h": toolbar.isHidden.toggle()
         default: super.keyDown(with: e)
         }
-    }
-
-    private func setTool(_ t: Tool) {
-        if !pts.isEmpty { finish() }
-        tool = t
-        needsDisplay = true
     }
 
     // MARK: 绘制
@@ -850,11 +1042,20 @@ final class EditorView: NSView {
         c.setFillColor(NSColor(white: 0, alpha: 0.25).cgColor)
         c.fill(bounds)
 
+        let overToolbar = cursor.map { !toolbar.isHidden && toolbar.frame.contains($0) } ?? false
+        // 工具栏下面不画任何东西
+        if !toolbar.isHidden {
+            c.addRect(bounds); c.addPath(CGPath(roundedRect: toolbar.frame, cornerWidth: 16, cornerHeight: 16, transform: nil))
+            c.clip(using: .evenOdd)
+        }
+
         // 已有坏区
-        let hover = drawing ? nil : cursor.flatMap(shapeIndex(at:))
+        let hover = (drawing || overToolbar) ? nil : cursor.flatMap(shapeIndex(at:))
         for (i, s) in shapes.enumerated() {
             let p = s.path(in: bounds)
-            c.addPath(p); c.setFillColor(NSColor.systemRed.withAlphaComponent(0.5).cgColor); c.fillPath()
+            c.addPath(p)
+            c.setFillColor((i == hover ? NSColor.systemRed.withAlphaComponent(0.7) : NSColor.systemRed.withAlphaComponent(0.5)).cgColor)
+            c.fillPath()
             c.addPath(p)
             c.setStrokeColor(i == hover ? NSColor.white.cgColor : NSColor.systemRed.cgColor)
             c.setLineWidth(i == hover ? 2.5 : 1.5)
@@ -863,7 +1064,7 @@ final class EditorView: NSView {
 
         // 正在画的形状
         var live = pts
-        if let cur = cursor, !pts.isEmpty { live.append(snap(cur)) }
+        if let cur = cursor, !pts.isEmpty, !overToolbar { live.append(snap(cur)) }
         let yellow = NSColor.systemYellow
         if tool == .polygon, live.count >= 2 {
             let p = CGMutablePath(); p.addLines(between: live); p.closeSubpath()
@@ -877,70 +1078,34 @@ final class EditorView: NSView {
             let l = CGMutablePath(); l.addLines(between: live)
             c.addPath(l); c.setStrokeColor(yellow.cgColor); c.setLineWidth(1); c.strokePath()
         }
-        for p in pts {
+        for (i, p) in pts.enumerated() {
+            let r: CGFloat = i == 0 ? 6 : 4
             c.setFillColor(yellow.cgColor)
-            c.fillEllipse(in: CGRect(x: p.x - 4, y: p.y - 4, width: 8, height: 8))
+            c.fillEllipse(in: CGRect(x: p.x - r, y: p.y - r, width: r * 2, height: r * 2))
         }
         if let r = dragRect {
             c.setFillColor(yellow.withAlphaComponent(0.3).cgColor); c.fill(r)
             c.setStrokeColor(yellow.cgColor); c.setLineWidth(2); c.stroke(r)
         }
 
+        guard let cur = cursor, !overToolbar else { return }
+
         // 线条工具的笔宽预览
-        if tool == .line, let cur = cursor {
+        if tool == .line {
             let s = snap(cur)
             c.setStrokeColor(NSColor.white.withAlphaComponent(0.8).cgColor); c.setLineWidth(1)
             c.strokeEllipse(in: CGRect(x: s.x - lineWidth / 2, y: s.y - lineWidth / 2, width: lineWidth, height: lineWidth))
         }
-
+        // 吸附提示：落点会吸到边上时画一个小方块
+        let s = snap(cur)
+        if s != cur && (s.x == 0 || s.y == 0 || s.x == W || s.y == H) {
+            c.setStrokeColor(NSColor.systemYellow.cgColor); c.setLineWidth(2)
+            c.stroke(CGRect(x: s.x - 6, y: s.y - 6, width: 12, height: 12))
+        }
         // 贯穿全屏的十字线：鼠标进了黑区也能从可见部分看出它在哪
-        if let cur = cursor {
-            c.setFillColor(NSColor.systemGreen.withAlphaComponent(0.9).cgColor)
-            c.fill(CGRect(x: 0, y: cur.y - 0.5, width: W, height: 1))
-            c.fill(CGRect(x: cur.x - 0.5, y: 0, width: 1, height: H))
-        }
-
-        if showTip { drawTip() }
-    }
-
-    private var tipText: NSString {
-        let t = { (x: Tool, key: String) in (self.tool == x ? "▶ " : "   ") + "\(key) \(x.rawValue)" }
-        let head = [t(.polygon, "1"), t(.rect, "2"), t(.line, "3")].joined(separator: "     ")
-        let body: String
-        switch tool {
-        case .polygon:
-            body = "沿坏区边缘逐点单击（或按住拖动描边），把它围起来；靠近屏幕边缘会吸附到边和角\n双击 / 回车 / 右键：完成这一块"
-        case .rect:
-            body = "按住拖出一个矩形；靠近屏幕边缘会吸附"
-        case .line:
-            body = "用于一条坏线（竖线、横线、裂纹）：沿线点击，两端点在屏幕边缘即可贯穿\n宽度 \(Int(lineWidth))pt（滚轮 或 [ ] 调整） · 双击 / 回车 / 右键：完成"
-        }
-        return """
-        正在编辑：\(screenLabel)
-        \(head)
-        \(body)
-        右键点已有坏区：删除 · ⌘Z 撤销 · Delete 删上一个点 · ⌘Delete 全部清空 · H 隐藏说明
-        没在画时：回车 保存并退出 · Esc 放弃修改 · Tab 保存并切换到下一块屏幕
-        """ as NSString
-    }
-
-    private var tipAttrs: [NSAttributedString.Key: Any] {
-        let para = NSMutableParagraphStyle(); para.alignment = .center; para.lineSpacing = 4
-        return [.font: NSFont.systemFont(ofSize: 14, weight: .medium), .foregroundColor: NSColor.white, .paragraphStyle: para]
-    }
-
-    private func tipRect() -> CGRect {
-        let size = tipText.boundingRect(with: NSSize(width: 900, height: 400), options: .usesLineFragmentOrigin,
-                                        attributes: tipAttrs).size
-        let w = size.width + 48, h = size.height + 28
-        return CGRect(x: (W - w) / 2, y: tipAtTop ? 40 : H - h - 40, width: w, height: h)
-    }
-
-    private func drawTip() {
-        let r = tipRect()
-        NSColor(white: 0.1, alpha: 0.88).setFill()
-        NSBezierPath(roundedRect: r, xRadius: 12, yRadius: 12).fill()
-        tipText.draw(with: r.insetBy(dx: 24, dy: 14), options: .usesLineFragmentOrigin, attributes: tipAttrs)
+        c.setFillColor(NSColor.systemGreen.withAlphaComponent(0.9).cgColor)
+        c.fill(CGRect(x: 0, y: cur.y - 0.5, width: W, height: 1))
+        c.fill(CGRect(x: cur.x - 0.5, y: 0, width: 1, height: H))
     }
 }
 
@@ -962,7 +1127,8 @@ final class Editor {
         let screens = NSScreen.screens
         let idx = screens.firstIndex(of: screen) ?? 0
         let v = EditorView(frame: NSRect(origin: .zero, size: f.size), shapes: Store.shapes(for: screen))
-        v.screenLabel = "\(screen.localizedName)（\(idx + 1)/\(screens.count)）"
+        v.state.screenLabel = screens.count > 1 ? "\(screen.localizedName)（\(idx + 1)/\(screens.count)）" : screen.localizedName
+        v.state.multiScreen = screens.count > 1
         v.onFinish = { [weak self] s in
             if let s { Store.set(s, for: screen); History.add(screen: screen, shapes: s) }
             self?.window?.orderOut(nil)
