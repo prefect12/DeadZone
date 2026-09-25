@@ -9,6 +9,11 @@
   <sub>Carve out the broken part of your monitor on macOS — windows and the cursor treat it as if it doesn't exist.</sub>
 </p>
 
+<p align="center">
+  <img src="Resources/demo.gif" width="720" alt="DeadZone 示意动画">
+  <br><sub>示意动画 · Illustration</sub>
+</p>
+
 ---
 
 ## 为什么
@@ -87,6 +92,7 @@ xattr -dr com.apple.quarantine /Applications/DeadZone.app
 ./build.sh            # 构建到 build/DeadZone.app（Universal）
 ./build.sh --install  # 构建、安装并启动
 swift scripts/make_icon.swift Resources/icon.png   # 重新生成图标 PNG
+swift scripts/make_demo.swift Resources/demo.gif   # 重新生成 README 示意动画
 ```
 
 使用 ad-hoc 签名，并把指定要求固定为 bundle id，重新编译后不需要重新授予辅助功能权限。
