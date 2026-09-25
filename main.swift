@@ -1,6 +1,6 @@
-// DeadZone — 把显示器上坏掉的（不规则）区域"挖掉"，让窗口和鼠标都不进入那里。
+// DeadZone — 把显示器上坏掉的区域"挖掉"，让窗口和鼠标都当它不存在。
 // 菜单栏常驻应用。坐标约定：内部统一使用 CG 全局坐标（原点在主屏左上角，y 向下）。
-// 坏区用一张网格蒙版表示（每格约 4pt），可以是任意形状。
+// 坏区是一组任意形状（多边形 / 带宽度的线条），可以位于屏幕任何位置，数量不限。
 
 import Cocoa
 import ApplicationServices
@@ -18,6 +18,8 @@ func overlaps(_ a: CGRect, _ b: CGRect) -> Bool {
     return !i.isNull && i.width > 1 && i.height > 1
 }
 
+func dist(_ a: CGPoint, _ b: CGPoint) -> CGFloat { hypot(a.x - b.x, a.y - b.y) }
+
 extension NSScreen {
     var displayID: CGDirectDisplayID {
         (deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
@@ -29,10 +31,114 @@ extension NSScreen {
     var title: String { "\(localizedName)  (\(Int(frame.width))×\(Int(frame.height)))" }
 }
 
-// MARK: - 网格蒙版
+// MARK: - 坏区形状
+
+/// 一个坏区形状。坐标是屏幕内比例（0...1，左上原点），与分辨率无关。
+enum Shape {
+    case polygon([CGPoint])
+    case stroke([CGPoint], width: CGFloat)      // width 为相对屏幕宽度的比例
+
+    /// 把形状放到矩形 f 里（f 为左上原点坐标系，例如 CG 全局坐标里的屏幕、或翻转的视图）
+    func path(in f: CGRect) -> CGPath {
+        func map(_ p: CGPoint) -> CGPoint { CGPoint(x: f.minX + p.x * f.width, y: f.minY + p.y * f.height) }
+        switch self {
+        case .polygon(let pts):
+            let p = CGMutablePath()
+            p.addLines(between: pts.map(map))
+            p.closeSubpath()
+            return p
+        case .stroke(let pts, let w):
+            let line = CGMutablePath()
+            line.addLines(between: pts.map(map))
+            // 方头端点会多出半个线宽，保证贴到屏幕边缘的线条能完全盖住边缘
+            return line.copy(strokingWithWidth: max(1, w * f.width), lineCap: .square, lineJoin: .round, miterLimit: 4)
+        }
+    }
+
+    /// 是否是"细"坏区（平均宽度不超过 limit pt），用于"允许窗口跨过细线"
+    func isThin(in f: CGRect, limit: CGFloat = 40) -> Bool {
+        switch self {
+        case .stroke(_, let w): return w * f.width <= limit
+        case .polygon(let rel):
+            let pts = rel.map { CGPoint(x: $0.x * f.width, y: $0.y * f.height) }
+            guard pts.count >= 3 else { return true }
+            var area: CGFloat = 0, perim: CGFloat = 0
+            for i in 0..<pts.count {
+                let a = pts[i], b = pts[(i + 1) % pts.count]
+                area += a.x * b.y - b.x * a.y
+                perim += dist(a, b)
+            }
+            return perim > 0 && abs(area) / perim <= limit   // 2A/P 约等于平均宽度
+        }
+    }
+
+    var dict: [String: Any] {
+        switch self {
+        case .polygon(let p): return ["kind": "polygon", "pts": p.flatMap { [Double($0.x), Double($0.y)] }]
+        case .stroke(let p, let w): return ["kind": "stroke", "pts": p.flatMap { [Double($0.x), Double($0.y)] }, "w": Double(w)]
+        }
+    }
+
+    init?(dict d: [String: Any]) {
+        guard let kind = d["kind"] as? String, let flat = d["pts"] as? [Double], flat.count % 2 == 0 else { return nil }
+        let pts = stride(from: 0, to: flat.count, by: 2).map { CGPoint(x: flat[$0], y: flat[$0 + 1]) }
+        switch kind {
+        case "polygon" where pts.count >= 3: self = .polygon(pts)
+        case "stroke" where pts.count >= 2: self = .stroke(pts, width: CGFloat(d["w"] as? Double ?? 0.004))
+        default: return nil
+        }
+    }
+}
+
+func quadPoint(_ a: CGPoint, _ c: CGPoint, _ b: CGPoint, _ t: CGFloat) -> CGPoint {
+    let u = 1 - t
+    let k0 = u * u, k1 = 2 * u * t, k2 = t * t
+    return CGPoint(x: k0 * a.x + k1 * c.x + k2 * b.x, y: k0 * a.y + k1 * c.y + k2 * b.y)
+}
+
+func cubicPoint(_ a: CGPoint, _ c1: CGPoint, _ c2: CGPoint, _ b: CGPoint, _ t: CGFloat) -> CGPoint {
+    let u = 1 - t
+    let k0 = u * u * u, k1 = 3 * u * u * t, k2 = 3 * u * t * t, k3 = t * t * t
+    let x: CGFloat = k0 * a.x + k1 * c1.x + k2 * c2.x + k3 * b.x
+    let y: CGFloat = k0 * a.y + k1 * c1.y + k2 * c2.y + k3 * b.y
+    return CGPoint(x: x, y: y)
+}
+
+/// 把路径拍平成线段（曲线按采样近似），用于把鼠标投影到坏区边缘
+func flatten(_ path: CGPath) -> [(CGPoint, CGPoint)] {
+    var segs: [(CGPoint, CGPoint)] = []
+    var start = CGPoint.zero, cur = CGPoint.zero
+    path.applyWithBlock { el in
+        let e = el.pointee, p = e.points
+        switch e.type {
+        case .moveToPoint: start = p[0]; cur = p[0]
+        case .addLineToPoint: segs.append((cur, p[0])); cur = p[0]
+        case .addQuadCurveToPoint:
+            var prev = cur
+            let a = cur, c1 = p[0], b = p[1]
+            for i in 1...8 {
+                let q = quadPoint(a, c1, b, CGFloat(i) / 8)
+                segs.append((prev, q)); prev = q
+            }
+            cur = b
+        case .addCurveToPoint:
+            var prev = cur
+            let a = cur, c1 = p[0], c2 = p[1], b = p[2]
+            for i in 1...8 {
+                let q = cubicPoint(a, c1, c2, b, CGFloat(i) / 8)
+                segs.append((prev, q)); prev = q
+            }
+            cur = b
+        case .closeSubpath: segs.append((cur, start)); cur = start
+        @unknown default: break
+        }
+    }
+    return segs
+}
+
+// MARK: - 网格蒙版（窗口避让用：把任意形状栅格化成一组矩形）
 
 struct Mask {
-    static let cell: CGFloat = 4
     let cols: Int, rows: Int
     var bits: [UInt8]           // 行优先，第 0 行在顶部；1 = 坏
 
@@ -40,16 +146,8 @@ struct Mask {
         self.cols = cols; self.rows = rows
         self.bits = bits ?? [UInt8](repeating: 0, count: cols * rows)
     }
-    init(size: CGSize) {
-        self.init(cols: Int((size.width / Mask.cell).rounded(.up)), rows: Int((size.height / Mask.cell).rounded(.up)))
-    }
 
-    var isEmpty: Bool { !bits.contains(1) }
-
-    subscript(c: Int, r: Int) -> Bool {
-        get { c >= 0 && r >= 0 && c < cols && r < rows && bits[r * cols + c] == 1 }
-        set { if c >= 0 && r >= 0 && c < cols && r < rows { bits[r * cols + c] = newValue ? 1 : 0 } }
-    }
+    subscript(c: Int, r: Int) -> Bool { c >= 0 && r >= 0 && c < cols && r < rows && bits[r * cols + c] == 1 }
 
     /// 把蒙版合并成尽量少的矩形（网格单位，左上原点，右/下边界不含）
     func gridRects() -> [(c0: Int, r0: Int, c1: Int, r1: Int)] {
@@ -79,23 +177,114 @@ struct Mask {
     }
 }
 
-// MARK: - 配置存储（按显示器 UUID 存，网格按比例映射，分辨率变化后仍有效）
+/// 把路径画进一张 4pt 一格的灰度图，有任何覆盖的格子都算坏（宁多勿少），再合并成矩形
+func rasterize(_ paths: [CGPath], frame f: CGRect, cell: CGFloat = 4) -> [CGRect] {
+    guard !paths.isEmpty else { return [] }
+    let cols = Int((f.width / cell).rounded(.up)), rows = Int((f.height / cell).rounded(.up))
+    guard let ctx = CGContext(data: nil, width: cols, height: rows, bitsPerComponent: 8, bytesPerRow: cols,
+                              space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue),
+          let data = ctx.data else { return [] }
+    // CG 全局坐标（y 向下）-> 位图（内存第 0 行是顶部）
+    ctx.translateBy(x: 0, y: CGFloat(rows))
+    ctx.scaleBy(x: 1 / cell, y: -1 / cell)
+    ctx.translateBy(x: -f.minX, y: -f.minY)
+    ctx.setShouldAntialias(true)
+    ctx.setFillColor(gray: 1, alpha: 1)
+    for p in paths { ctx.addPath(p); ctx.fillPath() }
+
+    let buf = data.bindMemory(to: UInt8.self, capacity: cols * rows)
+    var m = Mask(cols: cols, rows: rows)
+    for i in 0..<(cols * rows) where buf[i] > 8 { m.bits[i] = 1 }
+    return m.gridRects().map {
+        CGRect(x: f.minX + CGFloat($0.c0) * cell, y: f.minY + CGFloat($0.r0) * cell,
+               width: CGFloat($0.c1 - $0.c0) * cell, height: CGFloat($0.r1 - $0.r0) * cell).intersection(f)
+    }
+}
+
+// MARK: - 运行时的坏区（按屏幕汇总）
 
 struct DeadZone {
     let screen: NSScreen
-    let rects: [CGRect]     // CG 全局坐标（网格合并出的矩形，用于窗口避让）
-    let bounds: CGRect
-    let line: [CGPoint]     // 平滑的分界线（从顶边到右边），用于鼠标贴边滑动
-    let shape: CGPath       // 死区多边形
-    let screenFrame: CGRect // CG 坐标，供后台线程使用（NSScreen 不宜跨线程访问）
+    let screenFrame: CGRect                 // CG 坐标，供后台线程使用（NSScreen 不宜跨线程访问）
+    let paths: [CGPath]                     // 每个形状一条路径（CG 全局坐标）
+    let edges: [[(CGPoint, CGPoint)]]       // 每个形状的轮廓线段
+    let rects: [CGRect]                     // 窗口避让用的栅格矩形
+    let bounds: CGRect                      // 所有形状在屏幕内的外接矩形
     var visibleFrame: CGRect { toCG(screen.visibleFrame) }
+
+    func contains(_ p: CGPoint) -> Bool { bounds.contains(p) && paths.contains { $0.contains(p) } }
+}
+
+// MARK: - 配置存储（按显示器 UUID 存比例坐标，分辨率变化后仍有效）
+
+enum Store {
+    static let key = "deadShapes"
+    static let legacyKey = "deadMasks"      // 1.0 版本的"右上方死区"蒙版
+    static var defaults: UserDefaults { .standard }
+
+    static func shapes(for s: NSScreen) -> [Shape] {
+        if let all = defaults.dictionary(forKey: key), let list = all[s.uuid] as? [[String: Any]] {
+            return list.compactMap(Shape.init(dict:))
+        }
+        return migrateLegacy(for: s)
+    }
+
+    static func set(_ shapes: [Shape], for s: NSScreen) {
+        var all = defaults.dictionary(forKey: key) ?? [:]
+        all[s.uuid] = shapes.map(\.dict)
+        defaults.set(all, forKey: key)
+    }
+
+    static func clearAll() {
+        defaults.removeObject(forKey: key)
+        defaults.removeObject(forKey: legacyKey)
+    }
+
+    /// 1.0 版本只支持"分界线右上方"的死区，存的是蒙版：把每行最左侧的坏格连成分界线，转成多边形
+    private static func migrateLegacy(for s: NSScreen) -> [Shape] {
+        guard let all = defaults.dictionary(forKey: legacyKey), let d = all[s.uuid] as? [String: Any],
+              let cols = d["cols"] as? Int, let rows = d["rows"] as? Int,
+              let data = d["bits"] as? Data, data.count == cols * rows else { return [] }
+        let m = Mask(cols: cols, rows: rows, bits: [UInt8](data))
+        var pts: [CGPoint] = []
+        var lastRow = -1
+        for r in 0..<rows {
+            guard let c = (0..<cols).first(where: { m[$0, r] }) else { continue }
+            let x = CGFloat(c) / CGFloat(cols)
+            if pts.isEmpty { pts.append(CGPoint(x: x, y: 0)) }
+            pts.append(CGPoint(x: x, y: (CGFloat(r) + 0.5) / CGFloat(rows)))
+            lastRow = r
+        }
+        guard lastRow >= 0 else { return [] }
+        pts.append(CGPoint(x: 1, y: CGFloat(lastRow + 1) / CGFloat(rows)))
+        let shapes = [Shape.polygon(simplify(pts, 0.001) + [CGPoint(x: 1, y: 0)])]
+        set(shapes, for: s)
+        return shapes
+    }
+
+    static func zones(windowsCrossThin: Bool) -> [DeadZone] {
+        NSScreen.screens.compactMap { s -> DeadZone? in
+            let shapes = shapes(for: s)
+            guard !shapes.isEmpty else { return nil }
+            let f = toCG(s.frame)
+            let paths = shapes.map { $0.path(in: f) }
+            let solid = zip(shapes, paths).filter { !(windowsCrossThin && $0.0.isThin(in: f)) }.map { $0.1 }
+            let bounds = paths.reduce(CGRect.null) { $0.union($1.boundingBoxOfPath) }.intersection(f)
+            return DeadZone(screen: s, screenFrame: f, paths: paths, edges: paths.map(flatten),
+                            rects: rasterize(solid, frame: f), bounds: bounds)
+        }
+    }
+
+    static func bool(_ k: String, default d: Bool) -> Bool {
+        defaults.object(forKey: k) == nil ? d : defaults.bool(forKey: k)
+    }
 }
 
 /// Douglas-Peucker 折线简化
 func simplify(_ pts: [CGPoint], _ eps: CGFloat) -> [CGPoint] {
     guard pts.count > 2 else { return pts }
     let a = pts.first!, b = pts.last!
-    let dx = b.x - a.x, dy = b.y - a.y, len = max(hypot(dx, dy), 0.0001)
+    let dx = b.x - a.x, dy = b.y - a.y, len = max(hypot(dx, dy), 0.0000001)
     var maxD: CGFloat = 0, idx = 0
     for i in 1..<(pts.count - 1) {
         let d = abs(dy * pts[i].x - dx * pts[i].y + b.x * a.y - b.y * a.x) / len
@@ -103,70 +292,6 @@ func simplify(_ pts: [CGPoint], _ eps: CGFloat) -> [CGPoint] {
     }
     if maxD <= eps { return [a, b] }
     return Array(simplify(Array(pts[...idx]), eps).dropLast()) + simplify(Array(pts[idx...]), eps)
-}
-
-/// 从蒙版推出"右上方死区"的平滑分界线：每一行死区最左侧的位置连成线
-func boundaryLine(_ m: Mask, frame f: CGRect) -> [CGPoint] {
-    let cw = f.width / CGFloat(m.cols), ch = f.height / CGFloat(m.rows)
-    var pts: [CGPoint] = []
-    var lastRow = -1
-    for r in 0..<m.rows {
-        guard let c = (0..<m.cols).first(where: { m[$0, r] }) else { continue }
-        let x = f.minX + CGFloat(c) * cw
-        if pts.isEmpty { pts.append(CGPoint(x: x, y: f.minY)) }
-        pts.append(CGPoint(x: x, y: f.minY + (CGFloat(r) + 0.5) * ch))
-        lastRow = r
-    }
-    guard lastRow >= 0 else { return [] }
-    pts.append(CGPoint(x: f.maxX, y: f.minY + CGFloat(lastRow + 1) * ch))
-    return simplify(pts, 2.5)
-}
-
-enum Store {
-    static let key = "deadMasks"
-    static var defaults: UserDefaults { .standard }
-
-    static func mask(for s: NSScreen) -> Mask? {
-        guard let all = defaults.dictionary(forKey: key),
-              let d = all[s.uuid] as? [String: Any],
-              let cols = d["cols"] as? Int, let rows = d["rows"] as? Int,
-              let data = d["bits"] as? Data, data.count == cols * rows else { return nil }
-        return Mask(cols: cols, rows: rows, bits: [UInt8](data))
-    }
-
-    static func set(_ m: Mask?, for s: NSScreen) {
-        var all = defaults.dictionary(forKey: key) ?? [:]
-        if let m, !m.isEmpty {
-            all[s.uuid] = ["cols": m.cols, "rows": m.rows, "bits": Data(m.bits)]
-        } else {
-            all[s.uuid] = nil
-        }
-        defaults.set(all, forKey: key)
-    }
-
-    static func clearAll() { defaults.removeObject(forKey: key) }
-
-    static func zones() -> [DeadZone] {
-        NSScreen.screens.compactMap { s -> DeadZone? in
-            guard let m = mask(for: s), !m.isEmpty else { return nil }
-            let f = toCG(s.frame)
-            let cw = f.width / CGFloat(m.cols), ch = f.height / CGFloat(m.rows)
-            let rects = m.gridRects().map {
-                CGRect(x: f.minX + CGFloat($0.c0) * cw, y: f.minY + CGFloat($0.r0) * ch,
-                       width: CGFloat($0.c1 - $0.c0) * cw, height: CGFloat($0.r1 - $0.r0) * ch)
-            }
-            let line = boundaryLine(m, frame: f)
-            let shape = CGMutablePath()
-            shape.addLines(between: line + [CGPoint(x: f.maxX, y: f.minY)])
-            shape.closeSubpath()
-            return DeadZone(screen: s, rects: rects, bounds: rects.reduce(CGRect.null) { $0.union($1) },
-                            line: line, shape: shape, screenFrame: f)
-        }
-    }
-
-    static func bool(_ k: String, default d: Bool) -> Bool {
-        defaults.object(forKey: k) == nil ? d : defaults.bool(forKey: k)
-    }
 }
 
 // MARK: - 不受屏幕约束的无边框窗口
@@ -181,11 +306,12 @@ final class KeyableWindow: FreeWindow {
 // MARK: - 黑色遮罩（形状与坏区一致）
 
 final class ShapeView: NSView {
-    var rects: [NSRect] = []
+    var paths: [CGPath] = []                // 已平移到视图坐标（左上原点）
+    override var isFlipped: Bool { true }
     override func draw(_ dirty: NSRect) {
-        NSGraphicsContext.current?.shouldAntialias = false
-        NSColor.black.setFill()
-        rects.forEach { $0.fill() }
+        guard let c = NSGraphicsContext.current?.cgContext else { return }
+        c.setFillColor(NSColor.black.cgColor)
+        for p in paths { c.addPath(p); c.fillPath() }
     }
 }
 
@@ -196,8 +322,9 @@ final class OverlayManager {
         windows.forEach { $0.orderOut(nil) }
         windows.removeAll()
         guard visible else { return }
-        for z in zones {
-            let frame = toNS(z.bounds)
+        for z in zones where !z.bounds.isNull {
+            let b = z.bounds.insetBy(dx: -1, dy: -1).intersection(z.screenFrame)
+            let frame = toNS(b)
             let w = FreeWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
             w.setFrame(frame, display: false)
             w.backgroundColor = .clear
@@ -208,10 +335,8 @@ final class OverlayManager {
             w.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.screenSaverWindow)))
             w.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
             let v = ShapeView(frame: NSRect(origin: .zero, size: frame.size))
-            v.rects = z.rects.map { r in
-                let n = toNS(r)
-                return NSRect(x: n.minX - frame.minX, y: n.minY - frame.minY, width: n.width, height: n.height)
-            }
+            var t = CGAffineTransform(translationX: -b.minX, y: -b.minY)
+            v.paths = z.paths.compactMap { $0.copy(using: &t) }
             w.contentView = v
             w.orderFrontRegardless()
             windows.append(w)
@@ -253,7 +378,7 @@ final class WindowAvoider {
         pendingMax = pendingMax.filter { item in
             if Date().timeIntervalSince(item.since) > 5 { return false }
             guard !boolAttr(item.win, "AXFullScreen"), let frame = frameOf(item.win),
-                  let z = zones.first(where: { $0.screen.frame.intersects(toNS(frame)) }),
+                  let z = zones.first(where: { $0.screenFrame.intersects(frame) }),
                   let target = maxRect(dead: all, screen: z.visibleFrame) else { return true }
             setFrame(item.win, target)
             // 动画可能还没完全结束，位置没到就下个 tick 再来
@@ -262,22 +387,33 @@ final class WindowAvoider {
         }
     }
 
-    /// 屏幕可用区域里避开所有死区后面积最大的矩形——相当于这块"异形屏"上的最大化
+    /// 屏幕可用区域里避开所有坏区后面积最大的矩形——相当于这块"异形屏"上的最大化
     func maxRect(dead: [CGRect], screen S: CGRect) -> CGRect? {
         let ds = dead.filter { overlaps($0, S) }
-        let tops = Set([S.minY] + ds.map { $0.maxY }.filter { $0 > S.minY && $0 < S.maxY })
-        let bottoms = Set([S.maxY] + ds.map { $0.minY }.filter { $0 > S.minY && $0 < S.maxY })
+        if ds.isEmpty { return S }
+        // 候选的上下边：屏幕边缘 + 各坏区的上下沿（按 8pt 取整去重，控制计算量）
+        func q(_ v: CGFloat) -> CGFloat { (v / 8).rounded() * 8 }
+        let inner = { (v: CGFloat) in v > S.minY && v < S.maxY }
+        let tops = Array(Set([S.minY] + ds.map { q($0.maxY) }.filter(inner))).sorted()
+        let bottoms = Array(Set([S.maxY] + ds.map { q($0.minY) }.filter(inner))).sorted()
         var best: CGRect?
-        func consider(_ top: CGFloat, _ bottom: CGFloat) {
-            guard bottom - top >= minH else { return }
-            let blocked = ds.filter { $0.minY < bottom - 1 && $0.maxY > top + 1 }.map { ($0.minX, $0.maxX) }
-            for (a, b) in free(S.minX, S.maxX, blocked) where b - a >= minW {
-                let r = CGRect(x: a, y: top, width: b - a, height: bottom - top)
-                if best == nil || r.width * r.height > best!.width * best!.height { best = r }
+        for top in tops {
+            for bottom in bottoms where bottom - top >= minH {
+                let blocked = ds.filter { $0.minY < bottom - 1 && $0.maxY > top + 1 }.map { ($0.minX, $0.maxX) }
+                for (a, b) in free(S.minX, S.maxX, blocked) where b - a >= minW {
+                    let r = CGRect(x: a, y: top, width: b - a, height: bottom - top)
+                    if best == nil || r.width * r.height > best!.width * best!.height { best = r }
+                }
             }
         }
-        for t in tops { consider(t, S.maxY) }
-        for b in bottoms { consider(S.minY, b) }
+        // 取整可能让边缘稍微压到坏区，最后再收紧一次
+        if var r = best {
+            for d in ds where overlaps(d, r) {
+                if d.maxY <= r.midY { r.size.height -= d.maxY - r.minY; r.origin.y = d.maxY }
+                else if d.minY >= r.midY { r.size.height = d.minY - r.minY }
+            }
+            best = r
+        }
         return best
     }
 
@@ -297,7 +433,7 @@ final class WindowAvoider {
             if boolAttr(win, kAXMinimizedAttribute) { continue }
             guard let frame = frameOf(win), let z = hit(frame, zones) else { continue }
 
-            // 系统全屏：退出全屏，改成"顶着死区的最大化"
+            // 系统全屏：退出全屏，改成"避开坏区的最大化"
             if boolAttr(win, "AXFullScreen") {
                 if !pendingMax.contains(where: { CFEqual($0.win, win) }) {
                     AXUIElementSetAttributeValue(win, "AXFullScreen" as CFString, kCFBooleanFalse)
@@ -318,7 +454,7 @@ final class WindowAvoider {
             let key = CFHash(win)
             if let (last, n) = attempts[key], last == frame, n >= 3 { continue }   // 放弃这个倔强的窗口
 
-            guard let target = plan(frame, dead: all, screen: z.visibleFrame) else { continue }
+            guard let target = plan(frame, dead: all, screen: S) ?? maxRect(dead: all, screen: S) else { continue }
             setFrame(win, target)
             let after = frameOf(win) ?? target
             let n = (attempts[key]?.0 == frame ? attempts[key]!.1 : 0) + 1
@@ -390,16 +526,25 @@ final class WindowAvoider {
     }
 }
 
-// MARK: - 鼠标拦截（CGEventTap：在事件送达前修正位置，贴着分界线滑动）
+// MARK: - 鼠标拦截（CGEventTap：在事件送达前修正位置）
+// - 窄的坏区（细线、裂纹）：沿运动方向直接跳到另一侧，就像它不存在
+// - 大块坏区：贴着边缘滑动
 // tap 跑在独立线程上：主线程做窗口操作时即使被某个应用卡住，也不会拖慢鼠标。
 
 final class MouseGuard {
     private let lock = NSLock()
     private var _zones: [DeadZone] = []
-    var zones: [DeadZone] {
-        get { lock.lock(); defer { lock.unlock() }; return _zones }
-        set { lock.lock(); _zones = newValue; lock.unlock() }
+    private var _screens: [CGRect] = []
+    private var lastGood: CGPoint?
+    private let jumpMax: CGFloat = 48           // 小于这个厚度的坏区直接跳过
+
+    func update(zones: [DeadZone], screens: [CGRect]) {
+        lock.lock(); _zones = zones; _screens = screens; lock.unlock()
     }
+    private func snapshot() -> ([DeadZone], [CGRect]) {
+        lock.lock(); defer { lock.unlock() }; return (_zones, _screens)
+    }
+
     var onMouseUp: (() -> Void)?
     fileprivate var tap: CFMachPort?
     private var thread: Thread?
@@ -443,39 +588,52 @@ final class MouseGuard {
             if let cb = onMouseUp { DispatchQueue.main.async(execute: cb) }
             return
         }
+        let (zones, screens) = snapshot()
         let p = e.location
-        guard let z = zones.first(where: { $0.bounds.contains(p) && $0.shape.contains(p) }),
-              let q = escape(p, z) else { return }
+        guard let z = zones.first(where: { $0.contains(p) }) else { lastGood = p; return }
+
+        func valid(_ q: CGPoint) -> Bool {
+            screens.contains { $0.contains(q) } && !zones.contains { $0.contains(q) }
+        }
+        guard let q = resolve(p, z, valid) ?? lastGood.flatMap({ valid($0) ? $0 : nil }) else { return }
+        lastGood = q
         e.location = q
         CGWarpMouseCursorPosition(q)
         CGAssociateMouseAndMouseCursorPosition(1)
     }
 
-    /// 分界线上离 p 最近的点，再往死区外侧推一点点
-    private func escape(_ p: CGPoint, _ z: DeadZone) -> CGPoint? {
-        let L = z.line
-        guard L.count >= 2 else { return nil }
-        var best = L[0], bestD = CGFloat.greatestFiniteMagnitude
-        for i in 0..<(L.count - 1) {
-            let a = L[i], b = L[i + 1]
-            let dx = b.x - a.x, dy = b.y - a.y, l2 = dx * dx + dy * dy
-            let t = l2 == 0 ? 0 : max(0, min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2))
-            let q = CGPoint(x: a.x + t * dx, y: a.y + t * dy)
-            let d = hypot(q.x - p.x, q.y - p.y)
-            if d < bestD { bestD = d; best = q }
+    private func resolve(_ p: CGPoint, _ z: DeadZone, _ valid: (CGPoint) -> Bool) -> CGPoint? {
+        // 1. 窄坏区：沿运动方向往前找出口，近的话直接跳过去
+        if let l = lastGood {
+            let dx = p.x - l.x, dy = p.y - l.y, n = hypot(dx, dy)
+            if n > 0.01 {
+                let ux = dx / n, uy = dy / n
+                var s: CGFloat = 1
+                while s <= jumpMax {
+                    let q = CGPoint(x: p.x + ux * s, y: p.y + uy * s)
+                    if valid(q) { return CGPoint(x: q.x + ux, y: q.y + uy) }
+                    s += 1
+                }
+            }
         }
-        // 外侧方向：从 p 指向最近点；若重合则用左下方
-        var dir = CGVector(dx: best.x - p.x, dy: best.y - p.y)
-        let n = hypot(dir.dx, dir.dy)
-        dir = n > 0.01 ? CGVector(dx: dir.dx / n, dy: dir.dy / n) : CGVector(dx: -0.7071, dy: 0.7071)
-        let f = z.screenFrame
-        for push: CGFloat in [0.5, 1, 2, 4, 8, 16] {
-            var q = CGPoint(x: best.x + dir.dx * push, y: best.y + dir.dy * push)
-            q.x = min(max(q.x, f.minX), f.maxX - 1)
-            q.y = min(max(q.y, f.minY), f.maxY - 1)
-            if !z.shape.contains(q) { return q }
+        // 2. 大坏区：投影到所在形状的最近边缘 + 按轴向滑动，取离 p 最近的合法点
+        var cands: [CGPoint] = []
+        for (i, path) in z.paths.enumerated() where path.contains(p) {
+            var best = p, bd = CGFloat.greatestFiniteMagnitude
+            for (a, b) in z.edges[i] {
+                let dx = b.x - a.x, dy = b.y - a.y, l2 = dx * dx + dy * dy
+                let t = l2 == 0 ? 0 : max(0, min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2))
+                let q = CGPoint(x: a.x + t * dx, y: a.y + t * dy)
+                let d = dist(p, q)
+                if d < bd { bd = d; best = q }
+            }
+            let n = max(bd, 0.001)
+            for push: CGFloat in [0.5, 1, 2, 4, 8] {
+                cands.append(CGPoint(x: best.x + (best.x - p.x) / n * push, y: best.y + (best.y - p.y) / n * push))
+            }
         }
-        return nil
+        if let l = lastGood { cands += [CGPoint(x: p.x, y: l.y), CGPoint(x: l.x, y: p.y)] }
+        return cands.filter(valid).min { dist($0, p) < dist($1, p) }
     }
 }
 
@@ -491,24 +649,34 @@ private func mouseTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: 
     return Unmanaged.passUnretained(event)
 }
 
-// MARK: - 坏区编辑器：画一条分界线，线的右上方全部是死区
-// 坏区里看不见鼠标，所以只需在看得见的一侧沿边界画线（点击或拖动均可）。
-// 线的两端会自动沿延长方向延伸到屏幕边缘，再沿屏幕边框绕过右上角闭合。
+// MARK: - 坏区编辑器
+// 坏区里常常什么都看不见，所以所有工具都是在"看得见的一侧"沿边缘操作；
+// 贯穿全屏的绿色十字线帮助判断鼠标进了黑区后的位置。
 
 final class EditorView: NSView {
-    var mask: Mask
-    var onFinish: ((Mask?) -> Void)?
+    enum Tool: String { case polygon = "多边形", rect = "矩形", line = "线条" }
 
-    private var line: [NSPoint] = []
-    private var cursor: NSPoint?
-    private var dragging = false
+    var shapes: [Shape]
+    var onFinish: (([Shape]?) -> Void)?
 
-    init(frame: NSRect, mask: Mask) {
-        self.mask = mask
+    private var tool: Tool = .polygon
+    private var pts: [CGPoint] = []            // 正在画的点（视图坐标，左上原点）
+    private var dragStart: CGPoint?
+    private var dragRect: CGRect?
+    private var lineWidth: CGFloat = 8          // 线条工具的宽度（pt）
+    private var cursor: CGPoint?
+    private var undo: [[Shape]] = []
+    private var showTip = true
+    private var tipAtTop = false
+    private let snapDist: CGFloat = 16
+
+    init(frame: NSRect, shapes: [Shape]) {
+        self.shapes = shapes
         super.init(frame: frame)
     }
     required init?(coder: NSCoder) { fatalError() }
 
+    override var isFlipped: Bool { true }       // 左上原点，和比例坐标方向一致
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
@@ -519,207 +687,237 @@ final class EditorView: NSView {
 
     private var W: CGFloat { bounds.width }
     private var H: CGFloat { bounds.height }
+    private var drawing: Bool { !pts.isEmpty || dragRect != nil }
 
-    // MARK: 几何
+    private func rel(_ p: CGPoint) -> CGPoint { CGPoint(x: p.x / W, y: p.y / H) }
+    private func loc(_ e: NSEvent) -> CGPoint { convert(e.locationInWindow, from: nil) }
 
-    private func clamp(_ p: NSPoint) -> NSPoint {
-        var q = NSPoint(x: min(max(p.x, 0), W), y: min(max(p.y, 0), H))
-        let s: CGFloat = 20     // 离边缘很近就吸附
-        if q.x < s { q.x = 0 }
-        if q.y < s { q.y = 0 }
-        if W - q.x < s { q.x = W }
-        if H - q.y < s { q.y = H }
+    /// 靠近屏幕边缘时吸附到边上（靠近两条边就吸到角上）
+    private func snap(_ p: CGPoint) -> CGPoint {
+        var q = CGPoint(x: min(max(p.x, 0), W), y: min(max(p.y, 0), H))
+        if q.x < snapDist { q.x = 0 }
+        if q.y < snapDist { q.y = 0 }
+        if W - q.x < snapDist { q.x = W }
+        if H - q.y < snapDist { q.y = H }
         return q
     }
 
-    private func onBorder(_ p: NSPoint) -> Bool { p.x <= 0 || p.y <= 0 || p.x >= W || p.y >= H }
-
-    /// 从 p 沿方向 d 射到屏幕边框的交点
-    private func ray(_ p: NSPoint, _ d: CGVector) -> NSPoint {
-        var t = CGFloat.greatestFiniteMagnitude
-        if d.dx > 0 { t = min(t, (W - p.x) / d.dx) } else if d.dx < 0 { t = min(t, -p.x / d.dx) }
-        if d.dy > 0 { t = min(t, (H - p.y) / d.dy) } else if d.dy < 0 { t = min(t, -p.y / d.dy) }
-        if t == .greatestFiniteMagnitude { return p }
-        return clamp(NSPoint(x: p.x + d.dx * t, y: p.y + d.dy * t))
+    private func commit(_ s: Shape) {
+        undo.append(shapes)
+        shapes.append(s)
     }
 
-    /// 两端延伸到屏幕边缘后的完整分界线
-    private func extended(_ pts: [NSPoint]) -> [NSPoint] {
-        guard pts.count >= 2 else { return pts }
-        var out = pts
-        // 用离端点稍远的点定方向，避免手抖
-        func dir(_ from: NSPoint, _ to: NSPoint) -> CGVector { CGVector(dx: to.x - from.x, dy: to.y - from.y) }
-        func farPoint(_ seq: [NSPoint]) -> NSPoint {
-            let e = seq[0]
-            return seq.dropFirst().first { hypot($0.x - e.x, $0.y - e.y) > 40 } ?? seq[1]
+    private func finish() {
+        switch tool {
+        case .polygon where pts.count >= 3: commit(.polygon(pts.map(rel)))
+        case .line where pts.count >= 2: commit(.stroke(pts.map(rel), width: lineWidth / W))
+        default: break
         }
-        if !onBorder(out[0]) { out.insert(ray(out[0], dir(farPoint(pts), pts[0])), at: 0) }
-        let rev = Array(pts.reversed())
-        if !onBorder(out.last!) { out.append(ray(rev[0], dir(farPoint(rev), rev[0]))) }
-        return out
+        pts.removeAll()
+        needsDisplay = true
     }
 
-    /// 边框上的点 -> 顺时针周长参数（从左上角开始）
-    private func perimeterT(_ p: NSPoint) -> CGFloat {
-        if p.y >= H { return p.x }
-        if p.x >= W { return W + (H - p.y) }
-        if p.y <= 0 { return W + H + (W - p.x) }
-        return 2 * W + H + p.y
-    }
-
-    private func corners(from t0: CGFloat, to t1: CGFloat, clockwise: Bool) -> [NSPoint] {
-        let P = 2 * (W + H)
-        let cs: [(CGFloat, NSPoint)] = [(W, NSPoint(x: W, y: H)), (W + H, NSPoint(x: W, y: 0)),
-                                        (2 * W + H, NSPoint(x: 0, y: 0)), (0, NSPoint(x: 0, y: H))]
-        func mod(_ v: CGFloat) -> CGFloat { (v.truncatingRemainder(dividingBy: P) + P).truncatingRemainder(dividingBy: P) }
-        let total = clockwise ? mod(t1 - t0) : mod(t0 - t1)
-        return cs.compactMap { (t, pt) -> (CGFloat, NSPoint)? in
-            let rel = clockwise ? mod(t - t0) : mod(t0 - t)
-            return rel > 0 && rel < total ? (rel, pt) : nil
-        }
-        .sorted { $0.0 < $1.0 }
-        .map { $0.1 }
-    }
-
-    private func path(_ pts: [NSPoint]) -> NSBezierPath {
-        let p = NSBezierPath()
-        p.move(to: pts[0]); pts.dropFirst().forEach(p.line); p.close()
-        return p
-    }
-
-    /// 分界线右上方的死区多边形
-    private func deadPolygon(_ pts: [NSPoint]) -> [NSPoint]? {
-        let full = extended(pts)
-        guard full.count >= 2 else { return nil }
-        let t0 = perimeterT(full.last!), t1 = perimeterT(full.first!)
-        let a = full + corners(from: t0, to: t1, clockwise: true)
-        let b = full + corners(from: t0, to: t1, clockwise: false)
-        // 选包含右上角的那一侧
-        let probe = NSPoint(x: W - 2, y: H - 2)
-        let inA = a.count > 2 && path(a).contains(probe), inB = b.count > 2 && path(b).contains(probe)
-        if inA != inB { return inA ? a : b }
-        return nil
-    }
-
-    private func buildMask(_ poly: [NSPoint]) -> Mask {
-        var m = Mask(cols: mask.cols, rows: mask.rows)
-        let cw = W / CGFloat(m.cols), ch = H / CGFloat(m.rows)
-        let p = path(poly)
-        for r in 0..<m.rows {
-            for c in 0..<m.cols {
-                // 格子任一角落在死区内就算死区（宁多勿少）
-                let x0 = CGFloat(c) * cw, y0 = H - CGFloat(r + 1) * ch
-                if p.contains(NSPoint(x: x0 + cw / 2, y: y0 + ch / 2)) ||
-                   p.contains(NSPoint(x: x0, y: y0)) || p.contains(NSPoint(x: x0 + cw, y: y0)) ||
-                   p.contains(NSPoint(x: x0, y: y0 + ch)) || p.contains(NSPoint(x: x0 + cw, y: y0 + ch)) {
-                    m[c, r] = true
-                }
-            }
-        }
-        return m
-    }
-
-    private func save() {
-        guard let poly = deadPolygon(line) else { NSSound.beep(); return }
-        onFinish?(buildMask(poly))
+    private func shapeIndex(at p: CGPoint) -> Int? {
+        shapes.indices.last { shapes[$0].path(in: bounds).contains(p) }
     }
 
     // MARK: 事件
 
     override func mouseDown(with e: NSEvent) {
-        if e.clickCount >= 2 { save(); return }
-        line.append(clamp(convert(e.locationInWindow, from: nil)))
-        dragging = false
+        let p = snap(loc(e))
+        switch tool {
+        case .rect:
+            dragStart = p
+        case .polygon, .line:
+            if e.clickCount >= 2 { finish(); return }
+            pts.append(p)
+        }
         needsDisplay = true
     }
+
     override func mouseDragged(with e: NSEvent) {
-        let p = clamp(convert(e.locationInWindow, from: nil))
-        cursor = p
-        if let last = line.last, hypot(p.x - last.x, p.y - last.y) > 6 { line.append(p); dragging = true }
+        let p = snap(loc(e))
+        cursor = loc(e)
+        switch tool {
+        case .rect:
+            if let s = dragStart {
+                dragRect = CGRect(x: min(s.x, p.x), y: min(s.y, p.y), width: abs(p.x - s.x), height: abs(p.y - s.y))
+            }
+        case .polygon, .line:
+            // 按住拖动 = 自由描边
+            if let last = pts.last, dist(last, p) > 6 { pts.append(p) }
+        }
         needsDisplay = true
     }
-    override func mouseMoved(with e: NSEvent) { cursor = convert(e.locationInWindow, from: nil); needsDisplay = true }
-    override func rightMouseDown(with e: NSEvent) { save() }
+
+    override func mouseUp(with e: NSEvent) {
+        if tool == .rect, let r = dragRect, r.width > 2, r.height > 2 {
+            commit(.polygon([CGPoint(x: r.minX, y: r.minY), CGPoint(x: r.maxX, y: r.minY),
+                             CGPoint(x: r.maxX, y: r.maxY), CGPoint(x: r.minX, y: r.maxY)].map(rel)))
+        }
+        dragStart = nil; dragRect = nil
+        needsDisplay = true
+    }
+
+    override func rightMouseDown(with e: NSEvent) {
+        if !pts.isEmpty { finish(); return }
+        // 没在画的时候，右键删除鼠标下的坏区
+        if let i = shapeIndex(at: loc(e)) {
+            undo.append(shapes)
+            shapes.remove(at: i)
+            needsDisplay = true
+        }
+    }
+
+    override func mouseMoved(with e: NSEvent) {
+        cursor = loc(e)
+        // 说明框挡住鼠标就换到另一边
+        if showTip, let c = cursor, tipRect().insetBy(dx: -20, dy: -20).contains(c) { tipAtTop.toggle() }
+        needsDisplay = true
+    }
+
+    override func scrollWheel(with e: NSEvent) {
+        guard tool == .line else { return }
+        lineWidth = min(300, max(2, lineWidth + e.scrollingDeltaY * (e.hasPreciseScrollingDeltas ? 0.2 : 2)))
+        needsDisplay = true
+    }
 
     override func keyDown(with e: NSEvent) {
+        let chars = (e.charactersIgnoringModifiers ?? "").lowercased()
+        let cmd = e.modifierFlags.contains(.command)
         switch e.keyCode {
-        case 36, 76: save()                                               // 回车：保存
-        case 53: onFinish?(nil)                                           // Esc：取消
-        case 51, 117: if !line.isEmpty { line.removeLast(); needsDisplay = true }   // Delete：删最后一个点
-        default:
-            if e.modifierFlags.contains(.command), e.charactersIgnoringModifiers == "z", !line.isEmpty {
-                line.removeLast(); needsDisplay = true
-            } else if e.charactersIgnoringModifiers?.lowercased() == "c" {
-                line.removeAll(); needsDisplay = true                    // C：重画
-            } else { super.keyDown(with: e) }
+        case 36, 76:                                            // 回车
+            if drawing { finish() } else { onFinish?(shapes) }
+            return
+        case 53:                                                // Esc
+            if drawing { pts.removeAll(); dragRect = nil; dragStart = nil; needsDisplay = true } else { onFinish?(nil) }
+            return
+        case 51, 117:                                           // Delete
+            if cmd { undo.append(shapes); shapes.removeAll(); pts.removeAll() }
+            else if !pts.isEmpty { pts.removeLast() }
+            needsDisplay = true
+            return
+        default: break
         }
+        if cmd && chars == "z" {
+            if !pts.isEmpty { pts.removeLast() } else if let s = undo.popLast() { shapes = s }
+            needsDisplay = true
+            return
+        }
+        switch chars {
+        case "1", "p": setTool(.polygon)
+        case "2", "r": setTool(.rect)
+        case "3", "l": setTool(.line)
+        case "[": lineWidth = max(2, lineWidth - (lineWidth > 20 ? 4 : 1)); needsDisplay = true
+        case "]": lineWidth = min(300, lineWidth + (lineWidth >= 20 ? 4 : 1)); needsDisplay = true
+        case "h": showTip.toggle(); needsDisplay = true
+        default: super.keyDown(with: e)
+        }
+    }
+
+    private func setTool(_ t: Tool) {
+        if !pts.isEmpty { finish() }
+        tool = t
+        needsDisplay = true
     }
 
     // MARK: 绘制
 
     override func draw(_ dirty: NSRect) {
-        NSColor(white: 0, alpha: 0.2).setFill()
-        bounds.fill()
+        guard let c = NSGraphicsContext.current?.cgContext else { return }
+        c.setFillColor(NSColor(white: 0, alpha: 0.25).cgColor)
+        c.fill(bounds)
 
-        var pts = line
-        if let c = cursor, !line.isEmpty, !dragging { pts.append(clamp(c)) }
-
-        // 预览死区
-        if let poly = deadPolygon(pts) {
-            NSColor.systemRed.withAlphaComponent(0.45).setFill()
-            path(poly).fill()
-        } else if line.isEmpty && !mask.isEmpty {
-            // 显示已保存的死区
-            let cw = W / CGFloat(mask.cols), ch = H / CGFloat(mask.rows)
-            NSColor.systemRed.withAlphaComponent(0.35).setFill()
-            for g in mask.gridRects() {
-                NSRect(x: CGFloat(g.c0) * cw, y: H - CGFloat(g.r1) * ch,
-                       width: CGFloat(g.c1 - g.c0) * cw, height: CGFloat(g.r1 - g.r0) * ch).fill()
-            }
+        // 已有坏区
+        let hover = drawing ? nil : cursor.flatMap(shapeIndex(at:))
+        for (i, s) in shapes.enumerated() {
+            let p = s.path(in: bounds)
+            c.addPath(p); c.setFillColor(NSColor.systemRed.withAlphaComponent(0.5).cgColor); c.fillPath()
+            c.addPath(p)
+            c.setStrokeColor(i == hover ? NSColor.white.cgColor : NSColor.systemRed.cgColor)
+            c.setLineWidth(i == hover ? 2.5 : 1.5)
+            c.strokePath()
         }
 
-        // 延伸部分（虚线）
-        if pts.count >= 2 {
-            let full = extended(pts)
-            let ext = NSBezierPath()
-            ext.move(to: full[0]); full.dropFirst().forEach(ext.line)
-            ext.lineWidth = 1.5; ext.setLineDash([6, 4], count: 2, phase: 0)
-            NSColor.white.setStroke(); ext.stroke()
+        // 正在画的形状
+        var live = pts
+        if let cur = cursor, !pts.isEmpty { live.append(snap(cur)) }
+        let yellow = NSColor.systemYellow
+        if tool == .polygon, live.count >= 2 {
+            let p = CGMutablePath(); p.addLines(between: live); p.closeSubpath()
+            c.addPath(p); c.setFillColor(yellow.withAlphaComponent(0.25).cgColor); c.fillPath()
+            let l = CGMutablePath(); l.addLines(between: live)
+            c.addPath(l); c.setStrokeColor(yellow.cgColor); c.setLineWidth(2); c.strokePath()
         }
-        // 用户画的线
-        if pts.count >= 2 {
-            let l = NSBezierPath()
-            l.move(to: pts[0]); pts.dropFirst().forEach(l.line)
-            l.lineWidth = 3; NSColor.systemYellow.setStroke(); l.stroke()
+        if tool == .line, live.count >= 2 {
+            let s = Shape.stroke(live.map(rel), width: lineWidth / W).path(in: bounds)
+            c.addPath(s); c.setFillColor(yellow.withAlphaComponent(0.45).cgColor); c.fillPath()
+            let l = CGMutablePath(); l.addLines(between: live)
+            c.addPath(l); c.setStrokeColor(yellow.cgColor); c.setLineWidth(1); c.strokePath()
         }
-        if !dragging {
-            for p in line {
-                let dot = NSBezierPath(ovalIn: NSRect(x: p.x - 4, y: p.y - 4, width: 8, height: 8))
-                NSColor.systemYellow.setFill(); dot.fill()
-            }
+        for p in pts {
+            c.setFillColor(yellow.cgColor)
+            c.fillEllipse(in: CGRect(x: p.x - 4, y: p.y - 4, width: 8, height: 8))
         }
-
-        // 贯穿全屏的十字线：鼠标进了黑区也能看出它在哪
-        if let c = cursor {
-            NSColor.systemGreen.withAlphaComponent(0.9).setFill()
-            NSRect(x: 0, y: c.y - 0.5, width: W, height: 1).fill()
-            NSRect(x: c.x - 0.5, y: 0, width: 1, height: H).fill()
+        if let r = dragRect {
+            c.setFillColor(yellow.withAlphaComponent(0.3).cgColor); c.fill(r)
+            c.setStrokeColor(yellow.cgColor); c.setLineWidth(2); c.stroke(r)
         }
 
-        let tip = """
-        沿坏区边界画一条线（在看得见的一侧，单击逐点 或 按住拖动都可以）
-        线两端会自动延伸到屏幕边缘，线的【右上方】全部当作死区（红色预览）
-        双击 / 回车 / 右键：保存并退出     Esc：取消
-        Delete 或 ⌘Z：删掉最后一个点     C：清空重画
+        // 线条工具的笔宽预览
+        if tool == .line, let cur = cursor {
+            let s = snap(cur)
+            c.setStrokeColor(NSColor.white.withAlphaComponent(0.8).cgColor); c.setLineWidth(1)
+            c.strokeEllipse(in: CGRect(x: s.x - lineWidth / 2, y: s.y - lineWidth / 2, width: lineWidth, height: lineWidth))
+        }
+
+        // 贯穿全屏的十字线：鼠标进了黑区也能从可见部分看出它在哪
+        if let cur = cursor {
+            c.setFillColor(NSColor.systemGreen.withAlphaComponent(0.9).cgColor)
+            c.fill(CGRect(x: 0, y: cur.y - 0.5, width: W, height: 1))
+            c.fill(CGRect(x: cur.x - 0.5, y: 0, width: 1, height: H))
+        }
+
+        if showTip { drawTip() }
+    }
+
+    private var tipText: NSString {
+        let t = { (x: Tool, key: String) in (self.tool == x ? "▶ " : "   ") + "\(key) \(x.rawValue)" }
+        let head = [t(.polygon, "1"), t(.rect, "2"), t(.line, "3")].joined(separator: "     ")
+        let body: String
+        switch tool {
+        case .polygon:
+            body = "沿坏区边缘逐点单击（或按住拖动描边），把它围起来；靠近屏幕边缘会吸附到边和角\n双击 / 回车 / 右键：完成这一块"
+        case .rect:
+            body = "按住拖出一个矩形；靠近屏幕边缘会吸附"
+        case .line:
+            body = "用于一条坏线（竖线、横线、裂纹）：沿线点击，两端点在屏幕边缘即可贯穿\n宽度 \(Int(lineWidth))pt（滚轮 或 [ ] 调整） · 双击 / 回车 / 右键：完成"
+        }
+        return """
+        \(head)
+        \(body)
+        右键点已有坏区：删除 · ⌘Z 撤销 · Delete 删上一个点 · ⌘Delete 全部清空 · H 隐藏说明
+        没在画时：回车 保存并退出 · Esc 放弃修改
         """ as NSString
-        let para = NSMutableParagraphStyle(); para.alignment = .center; para.lineSpacing = 5
-        let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 15, weight: .medium),
-                                                    .foregroundColor: NSColor.white, .paragraphStyle: para]
-        let size = tip.boundingRect(with: NSSize(width: 900, height: 400), options: .usesLineFragmentOrigin, attributes: attrs).size
-        let box = NSRect(x: 40, y: 40, width: size.width + 48, height: size.height + 32)   // 放在左下角，远离坏区
-        NSColor(white: 0.1, alpha: 0.85).setFill()
-        NSBezierPath(roundedRect: box, xRadius: 12, yRadius: 12).fill()
-        tip.draw(with: box.insetBy(dx: 24, dy: 16), options: .usesLineFragmentOrigin, attributes: attrs)
+    }
+
+    private var tipAttrs: [NSAttributedString.Key: Any] {
+        let para = NSMutableParagraphStyle(); para.alignment = .center; para.lineSpacing = 4
+        return [.font: NSFont.systemFont(ofSize: 14, weight: .medium), .foregroundColor: NSColor.white, .paragraphStyle: para]
+    }
+
+    private func tipRect() -> CGRect {
+        let size = tipText.boundingRect(with: NSSize(width: 900, height: 400), options: .usesLineFragmentOrigin,
+                                        attributes: tipAttrs).size
+        let w = size.width + 48, h = size.height + 28
+        return CGRect(x: (W - w) / 2, y: tipAtTop ? 40 : H - h - 40, width: w, height: h)
+    }
+
+    private func drawTip() {
+        let r = tipRect()
+        NSColor(white: 0.1, alpha: 0.88).setFill()
+        NSBezierPath(roundedRect: r, xRadius: 12, yRadius: 12).fill()
+        tipText.draw(with: r.insetBy(dx: 24, dy: 14), options: .usesLineFragmentOrigin, attributes: tipAttrs)
     }
 }
 
@@ -737,10 +935,9 @@ final class Editor {
         w.isReleasedWhenClosed = false
         w.acceptsMouseMovedEvents = true
 
-        let v = EditorView(frame: NSRect(origin: .zero, size: f.size),
-                           mask: Store.mask(for: screen) ?? Mask(size: f.size))
-        v.onFinish = { [weak self] m in
-            if let m { Store.set(m, for: screen) }
+        let v = EditorView(frame: NSRect(origin: .zero, size: f.size), shapes: Store.shapes(for: screen))
+        v.onFinish = { [weak self] s in
+            if let s { Store.set(s, for: screen) }
             self?.window?.orderOut(nil)
             self?.window = nil
             done()
@@ -796,6 +993,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var showOverlay: Bool { Store.bool("showOverlay", default: true) }
     private var avoidWindows: Bool { Store.bool("avoidWindows", default: true) }
     private var blockMouse: Bool { Store.bool("blockMouse", default: true) }
+    private var windowsCrossThin: Bool { Store.bool("windowsCrossThin", default: false) }
+
+    private var defaultEditScreen: NSScreen? {
+        NSScreen.screens.first(where: { CGDisplayIsBuiltin($0.displayID) == 0 }) ?? NSScreen.screens.last
+    }
 
     func applicationDidFinishLaunching(_ n: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -823,16 +1025,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.tickWindows()
         }
         reload()
-        if zones.isEmpty, let s = NSScreen.screens.first(where: { CGDisplayIsBuiltin($0.displayID) == 0 }) ?? NSScreen.screens.last {
-            startEditing(s)
-        }
+        if zones.isEmpty, let s = defaultEditScreen { startEditing(s) }
     }
 
     /// 再次打开 App（例如在访达里双击）时进入编辑，防止菜单栏图标被刘海挤掉后无从下手
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !editing, let s = NSScreen.screens.first(where: { CGDisplayIsBuiltin($0.displayID) == 0 }) ?? NSScreen.screens.last {
-            startEditing(s)
-        }
+        if !editing, let s = defaultEditScreen { startEditing(s) }
         return false
     }
 
@@ -842,9 +1040,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func reload() {
-        zones = Store.zones()
+        zones = Store.zones(windowsCrossThin: windowsCrossThin)
         overlays.rebuild(zones: zones, visible: showOverlay && !editing)
-        mouse.zones = zones
+        mouse.update(zones: zones, screens: NSScreen.screens.map { toCG($0.frame) })
         if blockMouse && !editing && !zones.isEmpty { mouse.start() } else { mouse.stop() }
         statusItem.button?.appearsDisabled = zones.isEmpty
     }
@@ -868,8 +1066,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
 
-        let names = zones.map { $0.screen.localizedName }
-        menu.addItem(disabled(names.isEmpty ? "还没有设置坏区" : "已屏蔽坏区：" + names.joined(separator: "、")))
+        let names = zones.map { "\($0.screen.localizedName)（\(Store.shapes(for: $0.screen).count) 块）" }
+        menu.addItem(disabled(names.isEmpty ? "还没有设置坏区" : "已屏蔽：" + names.joined(separator: "、")))
         if !AXIsProcessTrusted() {
             menu.addItem(item("⚠️ 需要辅助功能权限（点此授权）", #selector(openAXSettings)))
         }
@@ -878,7 +1076,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let editItem = NSMenuItem(title: "编辑坏区…", action: nil, keyEquivalent: "")
         let sub = NSMenu()
         for (i, s) in NSScreen.screens.enumerated() {
-            let it = item(s.title + (Store.mask(for: s) == nil ? "" : "  ●"), #selector(editScreen(_:)))
+            let it = item(s.title + (Store.shapes(for: s).isEmpty ? "" : "  ●"), #selector(editScreen(_:)))
             it.tag = i
             sub.addItem(it)
         }
@@ -889,6 +1087,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(toggle("黑色遮罩坏区", "showOverlay", showOverlay))
         menu.addItem(toggle("自动把窗口移出坏区", "avoidWindows", avoidWindows))
+        menu.addItem(toggle("允许窗口跨过细线坏区（≤40pt）", "windowsCrossThin", windowsCrossThin))
         menu.addItem(toggle("阻止鼠标进入坏区", "blockMouse", blockMouse))
         let login = item("开机自动启动", #selector(toggleLogin))
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
