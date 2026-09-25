@@ -1860,28 +1860,22 @@ struct BadgeView: View {
         HStack(spacing: 10) {
             Text(a.emoji).font(.system(size: 26)).grayscale(on ? 0 : 1).opacity(on ? 1 : 0.35)
             VStack(alignment: .leading, spacing: 2) {
-                Text(a.title).font(.callout.bold()).foregroundStyle(on ? .primary : .secondary).lineLimit(1).minimumScaleFactor(0.75)
-                // 悬停时把说明换成解锁日期，卡片高度保持一致
-                if hovering, let d = date {
-                    Text(L("解锁于 ", "Unlocked ") + Date(timeIntervalSince1970: d).formatted(date: .abbreviated, time: .omitted))
-                        .font(.caption2).foregroundStyle(Color.orange).lineLimit(2)
-                } else {
-                    Text(a.desc).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
-                }
+                Text(a.title).font(.callout.bold()).foregroundStyle(on ? .primary : .secondary)
+                Text(a.desc).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
             }
             Spacer(minLength: 0)
         }
         .padding(10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .frame(height: 72)
         .background(on ? Color.yellow.opacity(0.12) : Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
-        .overlay(alignment: .topTrailing) {
-            if on {
-                Image(systemName: "checkmark.circle.fill").font(.caption).foregroundStyle(Color.orange).padding(6)
+        .onHover { hovering = $0 && on }
+        // 悬停已解锁的成就：浮窗显示解锁时间
+        .popover(isPresented: $hovering, arrowEdge: .top) {
+            if let d = date {
+                Label(L("解锁于 ", "Unlocked ") + Date(timeIntervalSince1970: d).formatted(date: .long, time: .shortened),
+                      systemImage: "checkmark.circle.fill")
+                    .font(.callout).padding(10)
             }
         }
-        .onHover { hovering = $0 }
-        .help("\(a.title) — \(a.desc)")
     }
 }
 
