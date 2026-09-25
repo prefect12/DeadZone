@@ -401,6 +401,26 @@ final class WindowAvoider {
         }
         for pid in pids { fix(pid: pid, zones: zones) }
         finishPending(zones: zones)
+        fixOwnWindows(zones: zones)
+    }
+
+    /// 自己的普通窗口（主窗口等）也要避开坏区；遮罩、编辑器、提示这些无边框窗口不管
+    private func fixOwnWindows(zones: [DeadZone]) {
+        let all = zones.flatMap { $0.rects }
+        for w in NSApp.windows where w.isVisible && w.styleMask.contains(.titled) && !w.isMiniaturized {
+            let frame = toCG(w.frame)
+            guard let z = hit(frame, zones) else { continue }
+            let key = CFHashCode(bitPattern: w.windowNumber)
+            if let (last, n) = attempts[key], last == frame, n >= 3 { continue }
+            let S = z.visibleFrame
+            let maximized = frame.width >= S.width * 0.95 && frame.height >= S.height * 0.9
+            guard let target = (maximized ? nil : plan(frame, dead: all, screen: S)) ?? maxRect(dead: all, screen: S) else { continue }
+            w.setFrame(toNS(target), display: true, animate: true)
+            moves += 1
+            let after = toCG(w.frame)
+            let n = (attempts[key]?.0 == frame ? attempts[key]!.1 : 0) + 1
+            attempts[key] = (after, n)
+        }
     }
 
     private func finishPending(zones: [DeadZone]) {
@@ -1839,8 +1859,11 @@ struct BadgeView: View {
             Text(a.emoji).font(.system(size: 26)).grayscale(on ? 0 : 1).opacity(on ? 1 : 0.35)
             VStack(alignment: .leading, spacing: 2) {
                 Text(a.title).font(.callout.bold()).foregroundStyle(on ? .primary : .secondary)
-                Text(on ? Date(timeIntervalSince1970: date!).formatted(date: .abbreviated, time: .omitted) : a.desc)
-                    .font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+                Text(a.desc).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+                if let d = date {
+                    Label(Date(timeIntervalSince1970: d).formatted(date: .abbreviated, time: .omitted), systemImage: "checkmark.circle.fill")
+                        .font(.caption2).foregroundStyle(Color.orange)
+                }
             }
             Spacer(minLength: 0)
         }
