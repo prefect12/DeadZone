@@ -1851,6 +1851,15 @@ struct StatTile: View {
     }
 }
 
+/// 解锁时间：中文 2026年9月25日 23:38:12，英文按系统格式
+func unlockTime(_ d: Date) -> String {
+    guard !Lang.isEnglish else { return d.formatted(date: .long, time: .standard) }
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "zh_CN")
+    f.dateFormat = "yyyy年M月d日 HH:mm:ss"
+    return f.string(from: d)
+}
+
 struct BadgeView: View {
     let a: Achievement, date: Double?
     @State private var hovering = false
@@ -1871,7 +1880,7 @@ struct BadgeView: View {
         // 悬停已解锁的成就：浮窗显示解锁时间
         .popover(isPresented: $hovering, arrowEdge: .top) {
             if let d = date {
-                Label(L("解锁于 ", "Unlocked ") + Date(timeIntervalSince1970: d).formatted(date: .long, time: .shortened),
+                Label(L("解锁于 ", "Unlocked ") + unlockTime(Date(timeIntervalSince1970: d)),
                       systemImage: "checkmark.circle.fill")
                     .font(.callout).padding(10)
             }
