@@ -1853,23 +1853,35 @@ struct StatTile: View {
 
 struct BadgeView: View {
     let a: Achievement, date: Double?
+    @State private var hovering = false
+
     var body: some View {
         let on = date != nil
         HStack(spacing: 10) {
             Text(a.emoji).font(.system(size: 26)).grayscale(on ? 0 : 1).opacity(on ? 1 : 0.35)
             VStack(alignment: .leading, spacing: 2) {
-                Text(a.title).font(.callout.bold()).foregroundStyle(on ? .primary : .secondary)
-                Text(a.desc).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
-                if let d = date {
-                    Label(Date(timeIntervalSince1970: d).formatted(date: .abbreviated, time: .omitted), systemImage: "checkmark.circle.fill")
-                        .font(.caption2).foregroundStyle(Color.orange)
+                Text(a.title).font(.callout.bold()).foregroundStyle(on ? .primary : .secondary).lineLimit(1).minimumScaleFactor(0.75)
+                // 悬停时把说明换成解锁日期，卡片高度保持一致
+                if hovering, let d = date {
+                    Text(L("解锁于 ", "Unlocked ") + Date(timeIntervalSince1970: d).formatted(date: .abbreviated, time: .omitted))
+                        .font(.caption2).foregroundStyle(Color.orange).lineLimit(2)
+                } else {
+                    Text(a.desc).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
                 }
             }
             Spacer(minLength: 0)
         }
         .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(height: 72)
         .background(on ? Color.yellow.opacity(0.12) : Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
-        .help(a.desc)
+        .overlay(alignment: .topTrailing) {
+            if on {
+                Image(systemName: "checkmark.circle.fill").font(.caption).foregroundStyle(Color.orange).padding(6)
+            }
+        }
+        .onHover { hovering = $0 }
+        .help("\(a.title) — \(a.desc)")
     }
 }
 
