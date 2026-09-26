@@ -588,7 +588,8 @@ final class MouseGuard {
     private var _screens: [CGRect] = []
     private var lastGood: CGPoint?
     private let jumpMax: CGFloat = 48           // 小于这个厚度的坏区直接跳过
-    private var wasBlocked = false
+    private var lastBlockedAt: TimeInterval = -.infinity
+    private let blockGap: TimeInterval = 0.5    // 距上次被挡超过这么久才算新的一次撞墙
     private var _blocks = 0                     // 撞墙次数（成就统计用）
 
     /// 取走累计的撞墙次数
@@ -646,9 +647,12 @@ final class MouseGuard {
         }
         let (zones, screens) = snapshot()
         let p = e.location
-        guard let z = zones.first(where: { $0.contains(p) }) else { lastGood = p; wasBlocked = false; return }
-        if !wasBlocked { lock.lock(); _blocks += 1; lock.unlock() }
-        wasBlocked = true
+        guard let z = zones.first(where: { $0.contains(p) }) else { lastGood = p; return }
+        // 贴边滑动时光标会在边缘内外反复横跳，按"出去再进来"计数会暴涨；
+        // 改为按时间去抖：持续顶墙或贴边滑动只算一次
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - lastBlockedAt > blockGap { lock.lock(); _blocks += 1; lock.unlock() }
+        lastBlockedAt = now
 
         func valid(_ q: CGPoint) -> Bool {
             screens.contains { $0.contains(q) } && !zones.contains { $0.contains(q) }
