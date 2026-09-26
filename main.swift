@@ -383,6 +383,9 @@ final class WindowAvoider {
     /// 刚被我们退出全屏的窗口，等动画结束后放到"最大可用矩形"
     private var pendingMax: [(win: AXUIElement, since: Date)] = []
 
+    private static let dockLayer = Int(CGWindowLevelForKey(.dockWindow))
+    private static let movableLayers = Set(0..<Int(CGWindowLevelForKey(.statusWindow))).subtracting([dockLayer])
+
     func tick(zones: [DeadZone]) {
         guard !zones.isEmpty, AXIsProcessTrusted() else { return }
         // 用户正在拖动时不抢，松手后再处理
@@ -393,7 +396,10 @@ final class WindowAvoider {
         let me = getpid()
         var pids = Set<pid_t>()
         for info in list {
-            guard (info[kCGWindowLayer as String] as? Int) == 0,
+            // 普通窗口之外，浮动面板、模态弹窗（Wi-Fi 密码、钥匙串、"要打开吗"之类）也要推出坏区；
+            // 状态栏及以上（菜单栏、菜单、Dock）不碰
+            guard let layer = info[kCGWindowLayer as String] as? Int, Self.movableLayers.contains(layer),
+                  (info[kCGWindowOwnerName as String] as? String) != "Dock",
                   let pid = info[kCGWindowOwnerPID as String] as? pid_t, pid != me,
                   let b = info[kCGWindowBounds as String] as? NSDictionary,
                   let r = CGRect(dictionaryRepresentation: b) else { continue }
@@ -504,7 +510,14 @@ final class WindowAvoider {
             let key = CFHash(win)
             if let (last, n) = attempts[key], last == frame, n >= 3 { continue }   // 放弃这个倔强的窗口
 
-            guard let target = plan(frame, dead: all, screen: S) ?? maxRect(dead: all, screen: S) else { continue }
+            // 弹窗、对话框一般不能改大小：只挪位置，找一个整块放得下的地方
+            let target: CGRect?
+            if isSettable(win, kAXSizeAttribute) {
+                target = plan(frame, dead: all, screen: S) ?? maxRect(dead: all, screen: S)
+            } else {
+                target = place(frame, dead: all, screen: S)
+            }
+            guard let target else { continue }
             setFrame(win, target)
             moves += 1
             let after = frameOf(win) ?? target
@@ -527,7 +540,7 @@ final class WindowAvoider {
     }
 
     /// 计算一个不与坏区重叠的新位置：保持高度左右挪 / 保持宽度上下挪，放不下就缩小，取改动最小的
-    func plan(_ w: CGRect, dead: [CGRect], screen S: CGRect) -> CGRect? {
+    func plan(_ w: CGRect, dead: [CGRect], screen S: CGRect, keepSize: Bool = false) -> CGRect? {
         var cands: [CGRect] = []
 
         // 水平方向：与窗口同高度范围内的坏区投影到 x 轴
@@ -547,8 +560,21 @@ final class WindowAvoider {
             hypot(c.minX - w.minX, c.minY - w.minY) + 2 * (w.width - c.width) + 2 * (w.height - c.height)
         }
         return cands
-            .filter { c in c.width >= minW && c.height >= minH && !dead.contains { overlaps($0, c) } }
+            .filter { c in keepSize ? c.size == w.size : c.width >= minW && c.height >= minH }
+            .filter { c in !dead.contains { overlaps($0, c) } }
             .min { cost($0) < cost($1) }
+    }
+
+    /// 不改尺寸，只移动：优先左右 / 上下平移，都不行就放到最大可用矩形的中央
+    func place(_ w: CGRect, dead: [CGRect], screen S: CGRect) -> CGRect? {
+        if let r = plan(w, dead: dead, screen: S, keepSize: true) { return r }
+        guard let m = maxRect(dead: dead, screen: S), m.width >= w.width, m.height >= w.height else { return nil }
+        return CGRect(x: m.midX - w.width / 2, y: m.midY - w.height / 2, width: w.width, height: w.height).integral
+    }
+
+    private func isSettable(_ e: AXUIElement, _ a: String) -> Bool {
+        var ok: DarwinBoolean = false
+        return AXUIElementIsAttributeSettable(e, a as CFString, &ok) == .success && ok.boolValue
     }
 
     private func boolAttr(_ e: AXUIElement, _ a: String) -> Bool {
