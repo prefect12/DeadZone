@@ -2066,7 +2066,6 @@ final class AppModel: ObservableObject {
     @Published var showOverlay = true { didSet { persist("showOverlay", showOverlay) } }
     @Published var avoidWindows = true { didSet { persist("avoidWindows", avoidWindows) } }
     @Published var windowsCrossThin = false { didSet { persist("windowsCrossThin", windowsCrossThin) } }
-    @Published var floatingMenus = true { didSet { persist("floatingMenus", floatingMenus) } }
     @Published var blockMouse = true { didSet { persist("blockMouse", blockMouse) } }
     @Published var language = "system" {
         didSet {
@@ -2083,8 +2082,6 @@ final class AppModel: ObservableObject {
     var onToggleLogin: () -> Void = {}
     var onOpenAX: () -> Void = {}
     var onClearAll: () -> Void = {}
-    var onFloatingMenu: () -> Void = {}
-    var onSoundPanel: () -> Void = {}
 
     private var loading = false
     private func persist(_ k: String, _ v: Bool) {
@@ -2108,7 +2105,6 @@ final class AppModel: ObservableObject {
         showOverlay = Store.bool("showOverlay", default: true)
         avoidWindows = Store.bool("avoidWindows", default: true)
         windowsCrossThin = Store.bool("windowsCrossThin", default: false)
-        floatingMenus = Store.bool("floatingMenus", default: true)
         blockMouse = Store.bool("blockMouse", default: true)
         language = Lang.setting
     }
@@ -2284,13 +2280,6 @@ struct SettingsView: View {
                     Text(L("阻止鼠标进入坏区", "Keep the cursor out of dead zones")); Text(L("大块坏区贴边滑动，细线直接跳过", "Slides along large areas, jumps over thin lines"))
                 }
             }
-            Section(L("曲线工具栏", "Curved Toolbar")) {
-                Toggle(L("自动显示曲线工具栏", "Show curved toolbar automatically"), isOn: $model.floatingMenus)
-                Button(L("显示 / 隐藏曲线工具栏 · ⌃⌥M", "Show / Hide Curved Toolbar · ⌃⌥M")) { model.onFloatingMenu() }
-                Button(L("打开声音面板", "Open Sound Panel")) { model.onSoundPanel() }
-                Text(L("原生应用菜单、声音、时间与应用入口。无需屏幕录制；第三方状态图标尚未接管。", "Native app menus, sound, clock and app launcher. No Screen Recording required; third-party status icons are not yet integrated."))
-                    .font(.caption).foregroundStyle(.secondary)
-            }
             Section(L("通用", "General")) {
                 Picker(L("语言", "Language"), selection: $model.language) {
                     Text(L("跟随系统", "System")).tag("system")
@@ -2380,7 +2369,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let toaster = Toaster()
     private let model = AppModel()
     private let mainWindow = MainWindow()
-    private let floatingMenu = FloatingMenuController()
     private var ticks = 0
     private var timer: Timer?
     private var editing = false
@@ -2403,9 +2391,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(reload),
                                                name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
 
-        floatingMenu.zones = { Store.zones(windowsCrossThin: false) }
-        floatingMenu.openSettings = { [weak self] in self?.showMain(.settings) }
-        floatingMenu.start()
         if !AXIsProcessTrusted() { requestAccessibility() }
 
         mouse.onMouseUp = { [weak self] in
@@ -2437,8 +2422,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         model.onToggleLogin = { [weak self] in self?.toggleLogin() }
         model.onOpenAX = { [weak self] in self?.openAXSettings() }
         model.onClearAll = { [weak self] in self?.clearAll() }
-        model.onFloatingMenu = { [weak self] in self?.floatingMenu.toggle() }
-        model.onSoundPanel = { [weak self] in self?.floatingMenu.showSound() }
 
         // 已有坏区存成第一条圈选记录（与最近一条相同时会自动跳过）
         for scr in NSScreen.screens where !Store.shapes(for: scr).isEmpty { History.add(screen: scr, shapes: Store.shapes(for: scr)) }
@@ -2476,14 +2459,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func tickWindows() {
-        guard !editing, !floatingMenu.isInteracting, avoidWindows else { return }
+        guard !editing, avoidWindows else { return }
         avoider.tick(zones: zones)
     }
 
     @objc func reload() {
         zones = Store.zones(windowsCrossThin: windowsCrossThin)
         overlays.rebuild(zones: zones, visible: showOverlay && !editing)
-        floatingMenu.configure(enabled: Store.bool("floatingMenus", default: true), suspended: editing)
         mouse.update(zones: zones, screens: NSScreen.screens.map { toCG($0.frame) })
         if blockMouse && !editing && !zones.isEmpty { mouse.start() } else { mouse.stop() }
         statusItem.button?.appearsDisabled = zones.isEmpty
@@ -2505,14 +2487,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = AXIsProcessTrustedWithOptions(opts)
     }
 
-    @objc private func toggleFloatingMenu() { floatingMenu.toggle() }
-
     // MARK: 菜单
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         menu.addItem(item(L("打开 DeadZone…", "Open DeadZone…"), #selector(openMain), key: ","))
-        menu.addItem(item(L("曲线工具栏 · ⌃⌥M", "Curved Toolbar · ⌃⌥M"), #selector(toggleFloatingMenu), key: ""))
         menu.addItem(.separator())
 
         let names = zones.map { "\($0.screen.localizedName) (\(Store.shapes(for: $0.screen).count))" }
