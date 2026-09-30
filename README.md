@@ -25,7 +25,6 @@ DeadZone 让坏区在使用上"不存在"：
 - **窗口进不去**：拖进坏区的窗口松手即被推出，贴着坏区边缘摆放
 - **最大化 / 全屏 = 顶着坏区最大化**：点绿色按钮或双击标题栏时，尝试让窗口铺满"避开坏区后最大的矩形"；系统全屏会尝试退出后重新摆放
 - **鼠标进不去**：光标碰到边界会沿分界线平滑滑动，不会迷失在黑区里
-- **曲线工具栏**：沿坏区下沿排列原生应用菜单、应用入口、声音和时钟；按 `⌃⌥M` 显示或隐藏
 - **黑色遮罩**：用纯黑盖住坏区，减少花屏干扰
 - **任意形状、任意位置、任意数量**：角落、边缘、屏幕中间的斑块，或一条贯穿屏幕的坏线都可以
 - **细线可以"跨过去"**：鼠标碰到窄的坏线会直接跳到另一侧，就像那条线不存在；还可以选择允许窗口跨过细线
@@ -86,15 +85,7 @@ xattr -dr com.apple.quarantine /Applications/DeadZone.app
 
 ## 顶部菜单栏看不到时
 
-默认显示沿坏区下沿排列的原生曲线工具栏。文字保持水平，上方填充黑色遮罩，菜单在安全区域的独立面板内展开。
-
-- `Control + Option + M`（`⌃⌥M`）：显示 / 隐藏；设置和菜单栏也有入口。
-- 通过辅助功能读取当前应用的菜单并执行菜单命令。部分动态或自绘菜单可能不提供可访问内容。
-- 提供运行中应用切换、日期时间、声音设置及 DeadZone 设置入口。
-- 音频设备支持主音量控制时显示音量滑块；不支持时提供系统声音设置入口。
-- 不需要屏幕录制权限，不使用截图镜像或模拟鼠标点击。
-- 坏区变化或显示器重新连接后自动重排。设置中可关闭自动显示。
-- 原生系统菜单栏仍在原位置。此版本尚未接管 Bartender 等第三方状态图标，也未替代系统控制中心。
+再次打开 DeadZone.app 即可显示主窗口。DeadZone 不替代或移动系统菜单栏。
 
 ## 段位、成就与排名
 
@@ -137,14 +128,14 @@ xattr -dr com.apple.quarantine /Applications/DeadZone.app
 | 最大化 | 在可用区域内求避开坏区的最大矩形；系统全屏会被退出并改为该矩形 |
 | 鼠标拦截 | 独立线程上的 `CGEventTap`，在事件送达前修正光标：窄坏区沿运动方向跳过，大坏区投影到最近边缘贴边滑动 |
 
-窗口、坏区与主界面逻辑在 [`main.swift`](main.swift)，曲线工具栏在 [`FloatingMenu.swift`](FloatingMenu.swift)，轮廓布局在 [`ContourMenuLayout.swift`](ContourMenuLayout.swift)，成就界面在 [`AchievementUI.swift`](AchievementUI.swift)，3D 徽章在 [`Medal3D.swift`](Medal3D.swift)（系统 SceneKit），不依赖任何第三方库，**不联网，不收集任何数据**。
+窗口、坏区与主界面逻辑在 [`main.swift`](main.swift)，成就界面在 [`AchievementUI.swift`](AchievementUI.swift)，3D 徽章在 [`Medal3D.swift`](Medal3D.swift)（系统 SceneKit），不依赖任何第三方库，**不联网，不收集任何数据**。
 
 ## 已知限制
 
 - macOS 无法真正改变屏幕形状，DeadZone 是在行为层面模拟
 - Longshot 和系统截图工具的窗口不参与自动避让，避免移动冻结桌面/选区画面；截图工具自身的普通窗口也会保留原位
 - 分享、AirDrop、全屏及第三方面板的处理仍受应用的辅助功能接口约束；不可移动的系统面板无法保证避让
-- 如果菜单栏在这块屏幕上，坏区里的状态栏图标仍会被挡住；曲线工具栏提供应用菜单及常用功能入口，但尚未接管第三方状态图标
+- 如果菜单栏在这块屏幕上，坏区里的状态栏图标仍会被挡住；DeadZone 不接管系统菜单栏或第三方状态图标
 - 正在拖动窗口的过程中，窗口可以暂时进入坏区，松手后才会被推出
 - 进入坏区的系统全屏会尝试退出后改为"顶着坏区最大化"；网页视频和自绘全屏的行为取决于应用是否提供相应的辅助功能接口
 - 屏幕中间一条贯穿的坏线会把屏幕分成两半，窗口默认只能待在一侧；可在菜单中允许窗口跨过细线
@@ -152,7 +143,7 @@ xattr -dr com.apple.quarantine /Applications/DeadZone.app
 ## 开发
 
 ```bash
-./build.sh            # 构建到 build/DeadZone.app（Universal，默认版本 1.3.0）
+./build.sh            # 构建到 build/DeadZone.app（Universal，默认版本 1.3.1）
 ./build.sh --install  # 构建、安装并启动
 swift scripts/make_icon.swift Resources/icon.png   # 重新生成图标 PNG
 swift scripts/make_demo.swift Resources/demo.gif   # 重新生成 README 示意动画
@@ -162,8 +153,6 @@ swift scripts/make_demo.swift Resources/demo.gif   # 重新生成 README 示意�
 
 ```bash
 ./tests/run-achievement-ui.sh  # 成就覆盖、阈值/进度、持久解锁、导出与 3D 几何/暂停
-swiftc ContourMenuLayout.swift tests/ContourMenuLayoutTests.swift -o /tmp/deadzone-contour-tests
-/tmp/deadzone-contour-tests
 ```
 
 战绩背景 `Resources/ShareCardBackdrop.png` 使用 ImageGen 按本项目批准的界面方案生成；统计、文字和徽章由代码绘制。
