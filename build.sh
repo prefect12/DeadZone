@@ -5,18 +5,19 @@
 set -e
 cd "$(dirname "$0")"
 
-VERSION="${VERSION:-1.0.0}"
+VERSION="${VERSION:-1.3.0}"
 APP=build/DeadZone.app
 rm -rf build
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 for arch in arm64 x86_64; do
-  swiftc -O -swift-version 5 -target "$arch-apple-macos13.0" main.swift -o "build/DeadZone-$arch"
+  swiftc -O -swift-version 5 -target "$arch-apple-macos13.0" main.swift AchievementUI.swift Medal3D.swift FloatingMenu.swift ContourMenuLayout.swift -o "build/DeadZone-$arch"
 done
 lipo -create build/DeadZone-arm64 build/DeadZone-x86_64 -output "$APP/Contents/MacOS/DeadZone"
 rm build/DeadZone-arm64 build/DeadZone-x86_64
 
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+cp Resources/ShareCardBackdrop.png "$APP/Contents/Resources/ShareCardBackdrop.png"
 
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
