@@ -383,8 +383,15 @@ final class WindowAvoider {
     /// 刚被我们退出全屏的窗口，等动画结束后放到"最大可用矩形"
     private var pendingMax: [(win: AXUIElement, since: Date)] = []
 
+    /// 截图工具的冻结桌面/选区窗口属于屏幕级画面，移动它们会让桌面出现重影。
+    static func isCaptureHost(_ bundleIdentifier: String?) -> Bool {
+        guard let bundleIdentifier else { return false }
+        return ["com.chitaner.Longshot", "com.apple.screencaptureui",
+                "com.apple.screenshot.launcher"].contains(bundleIdentifier)
+    }
+
     private static let dockLayer = Int(CGWindowLevelForKey(.dockWindow))
-    private static let movableLayers = Set(0..<Int(CGWindowLevelForKey(.statusWindow))).subtracting([dockLayer])
+    private static let movableLayers = Set(0..<Int(CGWindowLevelForKey(.screenSaverWindow))).subtracting([dockLayer])
 
     func tick(zones: [DeadZone]) {
         guard !zones.isEmpty, AXIsProcessTrusted() else { return }
@@ -397,13 +404,17 @@ final class WindowAvoider {
         var pids = Set<pid_t>()
         for info in list {
             // 普通窗口之外，浮动面板、模态弹窗（Wi-Fi 密码、钥匙串、"要打开吗"之类）也要推出坏区；
-            // 状态栏及以上（菜单栏、菜单、Dock）不碰
+            // 高层分享面板也要发现；随后只处理 AXWindow / AXSheet，不移动菜单控件
             guard let layer = info[kCGWindowLayer as String] as? Int, Self.movableLayers.contains(layer),
                   (info[kCGWindowOwnerName as String] as? String) != "Dock",
                   let pid = info[kCGWindowOwnerPID as String] as? pid_t, pid != me,
                   let b = info[kCGWindowBounds as String] as? NSDictionary,
                   let r = CGRect(dictionaryRepresentation: b) else { continue }
             if hit(r, zones) != nil { pids.insert(pid) }
+        }
+        // 全屏切换与分享服务有时不出现在本轮 CGWindowList 中；同时检查前台应用。
+        if let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier, pid != me {
+            pids.insert(pid)
         }
         for pid in pids { fix(pid: pid, zones: zones) }
         finishPending(zones: zones)
@@ -432,14 +443,23 @@ final class WindowAvoider {
     private func finishPending(zones: [DeadZone]) {
         let all = zones.flatMap { $0.rects }
         pendingMax = pendingMax.filter { item in
-            if Date().timeIntervalSince(item.since) > 5 { return false }
-            guard !boolAttr(item.win, "AXFullScreen"), let frame = frameOf(item.win),
+            let elapsed = Date().timeIntervalSince(item.since)
+            if elapsed > 10 { return false }
+            // AXFullScreen 在动画结束前就会变为 false；太早调整会被恢复动画覆盖。
+            if elapsed < 1.5 { return true }
+            if boolAttr(item.win, "AXFullScreen") {
+                // 切换动画中设置可能暂时失败，后续 tick 重试，且只保留有限时间。
+                AXUIElementSetAttributeValue(item.win, "AXFullScreen" as CFString, kCFBooleanFalse)
+                return true
+            }
+            guard let frame = frameOf(item.win),
                   let z = zones.first(where: { $0.screenFrame.intersects(frame) }),
                   let target = maxRect(dead: all, screen: z.visibleFrame) else { return true }
             setFrame(item.win, target)
             // 动画可能还没完全结束，位置没到就下个 tick 再来
             guard let after = frameOf(item.win) else { return false }
             return abs(after.minX - target.minX) > 2 || abs(after.minY - target.minY) > 2
+                || abs(after.width - target.width) > 2 || abs(after.height - target.height) > 2
         }
     }
 
@@ -478,12 +498,11 @@ final class WindowAvoider {
     }
 
     private func fix(pid: pid_t, zones: [DeadZone]) {
+        // 在统一入口过滤，覆盖 CGWindowList 与前台应用两条发现路径。
+        guard !Self.isCaptureHost(NSRunningApplication(processIdentifier: pid)?.bundleIdentifier) else { return }
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 0.3)   // 卡死的应用最多等 0.3s
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
-              let wins = value as? [AXUIElement] else { return }
-
+        let wins = windowElements(app)
         let all = zones.flatMap { $0.rects }
         for win in wins {
             if boolAttr(win, kAXMinimizedAttribute) { continue }
@@ -493,12 +512,15 @@ final class WindowAvoider {
             if boolAttr(win, "AXFullScreen") {
                 if !pendingMax.contains(where: { CFEqual($0.win, win) }) {
                     AXUIElementSetAttributeValue(win, "AXFullScreen" as CFString, kCFBooleanFalse)
+                    // 异步切换可能返回 cannotComplete 但仍然执行；按实际状态确认。
                     pendingMax.append((win, Date()))
                 }
                 continue
             }
             if pendingMax.contains(where: { CFEqual($0.win, win) }) { continue }
 
+            // 无法移动的嵌入式控件不当成独立窗口，避免反复尝试。
+            guard isSettable(win, kAXPositionAttribute) else { continue }
             // 最大化 / 铺满（双击标题栏、⌥+绿色按钮等）：放到最大可用矩形
             let S = z.visibleFrame
             if frame.width >= S.width * 0.95 && frame.height >= S.height * 0.9,
@@ -512,19 +534,63 @@ final class WindowAvoider {
 
             // 弹窗、对话框一般不能改大小：只挪位置，找一个整块放得下的地方
             let target: CGRect?
-            if isSettable(win, kAXSizeAttribute) {
+            var roleValue: CFTypeRef?
+            AXUIElementCopyAttributeValue(win, kAXRoleAttribute as CFString, &roleValue)
+            let isPopover = (roleValue as? String) == "AXPopover"
+            if !isPopover && isSettable(win, kAXSizeAttribute) {
                 target = plan(frame, dead: all, screen: S) ?? maxRect(dead: all, screen: S)
             } else {
                 target = place(frame, dead: all, screen: S)
             }
             guard let target else { continue }
-            setFrame(win, target)
+            if isPopover {
+                var point = target.origin
+                if let value = AXValueCreate(.cgPoint, &point) {
+                    AXUIElementSetAttributeValue(win, kAXPositionAttribute as CFString, value)
+                }
+            } else { setFrame(win, target) }
             moves += 1
             let after = frameOf(win) ?? target
             let n = (attempts[key]?.0 == frame ? attempts[key]!.1 : 0) + 1
             attempts[key] = (after, n)
         }
         if attempts.count > 500 { attempts.removeAll() }
+    }
+
+    /// 分享服务和 sheet 不一定列在 AXWindows；有限遍历附属窗口与焦点祖先。
+    private func windowElements(_ app: AXUIElement) -> [AXUIElement] {
+        func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
+            var value: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else { return nil }
+            return value
+        }
+        var roots = attribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? []
+        if let value = attribute(app, kAXFocusedWindowAttribute), CFGetTypeID(value) == AXUIElementGetTypeID() {
+            roots.append(value as! AXUIElement)
+        }
+        if let value = attribute(app, kAXFocusedUIElementAttribute), CFGetTypeID(value) == AXUIElementGetTypeID() {
+            var element = value as! AXUIElement
+            for _ in 0..<8 {
+                let role = attribute(element, kAXRoleAttribute) as? String
+                if role == kAXWindowRole || role == kAXSheetRole || role == "AXPopover" { roots.append(element) }
+                guard let parent = attribute(element, kAXParentAttribute), CFGetTypeID(parent) == AXUIElementGetTypeID() else { break }
+                element = parent as! AXUIElement
+            }
+        }
+        var seen = Set<CFHashCode>(), result: [AXUIElement] = []
+        var queue = roots.map { ($0, 0) }, index = 0
+        while index < queue.count && index < 120 {
+            let (element, depth) = queue[index]; index += 1
+            guard seen.insert(CFHash(element)).inserted else { continue }
+            let role = attribute(element, kAXRoleAttribute) as? String
+            if role == kAXWindowRole || role == kAXSheetRole || role == "AXPopover" { result.append(element) }
+            guard depth < 3 else { continue }
+            for name in ["AXSheets", kAXChildrenAttribute] {
+                let children = attribute(element, name) as? [AXUIElement] ?? []
+                queue.append(contentsOf: children.prefix(max(0, 120 - queue.count)).map { ($0, depth + 1) })
+            }
+        }
+        return result
     }
 
     /// 在 [lo, hi] 中扣掉被占用的区间，返回空闲区间
@@ -1680,6 +1746,10 @@ struct Achievement: Identifiable {
         Achievement(id: "line", emoji: "📏", title: L("一线之隔", "A Fine Line"), desc: L("标记一条坏线", "Mark a dead line")) { $0.hasLine },
         Achievement(id: "multi", emoji: "🖥️", title: L("难兄难弟", "Brothers in Misfortune"), desc: L("两块以上屏幕都有坏区", "Dead zones on 2+ screens")) { $0.brokenScreens >= 2 },
         Achievement(id: "block100", emoji: "🚧", title: L("此路不通", "Dead End"), desc: L("鼠标撞墙 100 次", "Cursor hits the wall 100 times")) { $0.blocks >= 100 },
+        Achievement(id: "block500", emoji: "🛡️", title: L("安全边界", "Safe Boundary"), desc: L("鼠标撞墙 500 次", "Cursor hits the wall 500 times")) { $0.blocks >= 500 },
+        Achievement(id: "block1k", emoji: "⚔️", title: L("千次守护", "A Thousand Saves"), desc: L("鼠标撞墙 1000 次", "Cursor hits the wall 1,000 times")) { $0.blocks >= 1_000 },
+        Achievement(id: "block2k", emoji: "🏰", title: L("铜墙铁壁", "Iron Wall"), desc: L("鼠标撞墙 2000 次", "Cursor hits the wall 2,000 times")) { $0.blocks >= 2_000 },
+        Achievement(id: "block5k", emoji: "💎", title: L("固若金汤", "Unbreakable"), desc: L("鼠标撞墙 5000 次", "Cursor hits the wall 5,000 times")) { $0.blocks >= 5_000 },
         Achievement(id: "block10k", emoji: "🐂", title: L("撞了南墙也不回头", "Stubborn as a Mule"), desc: L("鼠标撞墙 10000 次", "Cursor hits the wall 10,000 times")) { $0.blocks >= 10_000 },
         Achievement(id: "move100", emoji: "📦", title: L("窗口搬运工", "Window Mover"), desc: L("窗口被推开 100 次", "Windows pushed away 100 times")) { $0.moves >= 100 },
     ] }
@@ -1727,7 +1797,7 @@ struct ToastView: View {
     let a: Achievement
     var body: some View {
         HStack(spacing: 14) {
-            Text(a.emoji).font(.system(size: 38))
+            AchievementMedal(a: a, size: 48)
             VStack(alignment: .leading, spacing: 3) {
                 Text(L("解锁成就", "Achievement Unlocked")).font(.caption).foregroundStyle(.secondary)
                 Text(a.title).font(.title3.bold())
@@ -1890,117 +1960,6 @@ func unlockTime(_ d: Date) -> String {
     return f.string(from: d)
 }
 
-struct BadgeView: View {
-    let a: Achievement, date: Double?
-    @State private var hovering = false
-
-    var body: some View {
-        let on = date != nil
-        HStack(spacing: 10) {
-            Text(a.emoji).font(.system(size: 26)).grayscale(on ? 0 : 1).opacity(on ? 1 : 0.35)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(a.title).font(.callout.bold()).foregroundStyle(on ? .primary : .secondary)
-                Text(a.desc).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(10)
-        .background(on ? Color.yellow.opacity(0.12) : Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
-        .onHover { hovering = $0 && on }
-        // 悬停已解锁的成就：浮窗显示解锁时间
-        .popover(isPresented: $hovering, arrowEdge: .top) {
-            if let d = date {
-                Label(L("解锁于 ", "Unlocked ") + unlockTime(Date(timeIntervalSince1970: d)),
-                      systemImage: "checkmark.circle.fill")
-                    .font(.callout).padding(10)
-            }
-        }
-    }
-}
-
-/// 用来分享的战绩卡片
-struct ShareCard: View {
-    let r: Report
-    var body: some View {
-        let w = r.worst
-        let t = Tier.of(w?.damage ?? 0)
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Text(L("DeadZone 坏屏战绩", "DeadZone Broken-Screen Stats")).font(.system(size: 15, weight: .semibold)).foregroundStyle(.white.opacity(0.8))
-                Spacer()
-                Text("🏆 \(r.unlocked.count)/\(Achievement.all.count)").font(.system(size: 14, weight: .semibold)).foregroundStyle(.white)
-            }
-            HStack(alignment: .center, spacing: 18) {
-                VStack(alignment: .leading, spacing: 0) {
-                    Text(L("屏幕损坏面积", "Damaged area")).font(.system(size: 12)).foregroundStyle(.white.opacity(0.7))
-                    Text(pct(w?.damage ?? 0)).font(.system(size: 52, weight: .heavy, design: .rounded)).foregroundStyle(.white)
-                }
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("\(t.emoji) \(t.name)").font(.system(size: 22, weight: .bold)).foregroundStyle(.white)
-                    Text(t.comment).font(.system(size: 13)).foregroundStyle(.white.opacity(0.8))
-                }
-            }
-            VStack(alignment: .leading, spacing: 3) {
-                Text("🌏 " + Ranking.beat(w?.damage ?? 0))
-                    .font(.system(size: 14, weight: .semibold)).foregroundStyle(.white)
-                if let o = Ranking.oneIn(w?.damage ?? 0) {
-                    Text(o).font(.system(size: 13)).foregroundStyle(.white.opacity(0.85)).padding(.leading, 24)
-                }
-            }
-            Text(L("已坚持使用 \(r.days) 天 · 鼠标撞墙 \(r.blocks) 次 · 窗口被推开 \(r.moves) 次", "\(r.days) days in use · \(r.blocks) wall hits · \(r.moves) windows moved"))
-                .font(.system(size: 13)).foregroundStyle(.white.opacity(0.85))
-            Text("github.com/prefect12/DeadZone").font(.system(size: 11, design: .monospaced)).foregroundStyle(.white.opacity(0.6))
-        }
-        .padding(24)
-        .frame(width: 440)
-        .background(LinearGradient(colors: [Color(red: 0.13, green: 0.18, blue: 0.29), Color(red: 0.36, green: 0.16, blue: 0.42)],
-                                   startPoint: .topLeading, endPoint: .bottomTrailing))
-    }
-}
-
-struct StatsView: View {
-    let report: Report
-    @State private var copied = false
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                if report.screens.isEmpty {
-                    Text(L("还没有标记坏区。标记之后，这里会显示你的损坏面积和段位。", "No dead zones yet. Once you mark some, your damage and tier will show up here.")).foregroundStyle(.secondary)
-                }
-                ForEach(report.screens) { DamageCard(s: $0) }
-
-                HStack(spacing: 10) {
-                    StatTile(label: L("坚持使用", "Days in use"), value: L("\(report.days) 天", "\(report.days)"))
-                    StatTile(label: L("鼠标撞墙", "Wall hits"), value: L("\(report.blocks) 次", "\(report.blocks)"))
-                    StatTile(label: L("窗口被推开", "Windows moved"), value: L("\(report.moves) 次", "\(report.moves)"))
-                }
-
-                HStack {
-                    Text(L("成就", "Achievements")).font(.headline)
-                    Text("\(report.unlocked.count)/\(Achievement.all.count)").foregroundStyle(.secondary)
-                    Spacer()
-                    Button(copied ? L("已复制到剪贴板 ✓", "Copied to clipboard ✓") : L("复制战绩卡片", "Copy Stats Card")) { copyCard() }
-                }
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 160), spacing: 8)], spacing: 8) {
-                    ForEach(Achievement.all) { BadgeView(a: $0, date: report.unlocked[$0.id]) }
-                }
-                Text(L("所有统计只保存在本机，不联网。", "All stats stay on this Mac. Nothing goes online.")).font(.caption2).foregroundStyle(.tertiary)
-            }
-            .padding(22)
-        }
-    }
-
-    private func copyCard() {
-        let renderer = ImageRenderer(content: ShareCard(r: report))
-        renderer.scale = 2
-        guard let img = renderer.nsImage else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.writeObjects([img])
-        copied = true
-    }
-}
-
 // MARK: - 圈选记录
 
 struct HistoryRecord: Identifiable {
@@ -2107,6 +2066,7 @@ final class AppModel: ObservableObject {
     @Published var showOverlay = true { didSet { persist("showOverlay", showOverlay) } }
     @Published var avoidWindows = true { didSet { persist("avoidWindows", avoidWindows) } }
     @Published var windowsCrossThin = false { didSet { persist("windowsCrossThin", windowsCrossThin) } }
+    @Published var floatingMenus = true { didSet { persist("floatingMenus", floatingMenus) } }
     @Published var blockMouse = true { didSet { persist("blockMouse", blockMouse) } }
     @Published var language = "system" {
         didSet {
@@ -2123,6 +2083,8 @@ final class AppModel: ObservableObject {
     var onToggleLogin: () -> Void = {}
     var onOpenAX: () -> Void = {}
     var onClearAll: () -> Void = {}
+    var onFloatingMenu: () -> Void = {}
+    var onSoundPanel: () -> Void = {}
 
     private var loading = false
     private func persist(_ k: String, _ v: Bool) {
@@ -2146,6 +2108,7 @@ final class AppModel: ObservableObject {
         showOverlay = Store.bool("showOverlay", default: true)
         avoidWindows = Store.bool("avoidWindows", default: true)
         windowsCrossThin = Store.bool("windowsCrossThin", default: false)
+        floatingMenus = Store.bool("floatingMenus", default: true)
         blockMouse = Store.bool("blockMouse", default: true)
         language = Lang.setting
     }
@@ -2321,6 +2284,13 @@ struct SettingsView: View {
                     Text(L("阻止鼠标进入坏区", "Keep the cursor out of dead zones")); Text(L("大块坏区贴边滑动，细线直接跳过", "Slides along large areas, jumps over thin lines"))
                 }
             }
+            Section(L("曲线工具栏", "Curved Toolbar")) {
+                Toggle(L("自动显示曲线工具栏", "Show curved toolbar automatically"), isOn: $model.floatingMenus)
+                Button(L("显示 / 隐藏曲线工具栏 · ⌃⌥M", "Show / Hide Curved Toolbar · ⌃⌥M")) { model.onFloatingMenu() }
+                Button(L("打开声音面板", "Open Sound Panel")) { model.onSoundPanel() }
+                Text(L("原生应用菜单、声音、时间与应用入口。无需屏幕录制；第三方状态图标尚未接管。", "Native app menus, sound, clock and app launcher. No Screen Recording required; third-party status icons are not yet integrated."))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Section(L("通用", "General")) {
                 Picker(L("语言", "Language"), selection: $model.language) {
                     Text(L("跟随系统", "System")).tag("system")
@@ -2364,7 +2334,7 @@ struct MainView: View {
             }
             .navigationTitle(model.tab.title)
         }
-        .frame(minWidth: 780, minHeight: 560)
+        .frame(minWidth: model.tab == .achievements ? 1120 : 780, minHeight: 560)
     }
 }
 
@@ -2410,6 +2380,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let toaster = Toaster()
     private let model = AppModel()
     private let mainWindow = MainWindow()
+    private let floatingMenu = FloatingMenuController()
     private var ticks = 0
     private var timer: Timer?
     private var editing = false
@@ -2432,6 +2403,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(reload),
                                                name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
 
+        floatingMenu.zones = { Store.zones(windowsCrossThin: false) }
+        floatingMenu.openSettings = { [weak self] in self?.showMain(.settings) }
+        floatingMenu.start()
         if !AXIsProcessTrusted() { requestAccessibility() }
 
         mouse.onMouseUp = { [weak self] in
@@ -2463,6 +2437,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         model.onToggleLogin = { [weak self] in self?.toggleLogin() }
         model.onOpenAX = { [weak self] in self?.openAXSettings() }
         model.onClearAll = { [weak self] in self?.clearAll() }
+        model.onFloatingMenu = { [weak self] in self?.floatingMenu.toggle() }
+        model.onSoundPanel = { [weak self] in self?.floatingMenu.showSound() }
 
         // 已有坏区存成第一条圈选记录（与最近一条相同时会自动跳过）
         for scr in NSScreen.screens where !Store.shapes(for: scr).isEmpty { History.add(screen: scr, shapes: Store.shapes(for: scr)) }
@@ -2500,13 +2476,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func tickWindows() {
-        guard !editing, avoidWindows else { return }
+        guard !editing, !floatingMenu.isInteracting, avoidWindows else { return }
         avoider.tick(zones: zones)
     }
 
     @objc func reload() {
         zones = Store.zones(windowsCrossThin: windowsCrossThin)
         overlays.rebuild(zones: zones, visible: showOverlay && !editing)
+        floatingMenu.configure(enabled: Store.bool("floatingMenus", default: true), suspended: editing)
         mouse.update(zones: zones, screens: NSScreen.screens.map { toCG($0.frame) })
         if blockMouse && !editing && !zones.isEmpty { mouse.start() } else { mouse.stop() }
         statusItem.button?.appearsDisabled = zones.isEmpty
@@ -2528,11 +2505,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = AXIsProcessTrustedWithOptions(opts)
     }
 
+    @objc private func toggleFloatingMenu() { floatingMenu.toggle() }
+
     // MARK: 菜单
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         menu.addItem(item(L("打开 DeadZone…", "Open DeadZone…"), #selector(openMain), key: ","))
+        menu.addItem(item(L("曲线工具栏 · ⌃⌥M", "Curved Toolbar · ⌃⌥M"), #selector(toggleFloatingMenu), key: ""))
         menu.addItem(.separator())
 
         let names = zones.map { "\($0.screen.localizedName) (\(Store.shapes(for: $0.screen).count))" }
