@@ -390,6 +390,17 @@ final class WindowAvoider {
                 "com.apple.screenshot.launcher"].contains(bundleIdentifier)
     }
 
+    /// AirDrop 的分享扩展由系统宿主管理位置，AX 窗口可能只是远程视图的代理。
+    /// 不直接移动这些代理，否则系统布局与避让轮询会反复叠加位移。
+    static func isSystemSharingHost(_ bundleIdentifier: String?) -> Bool {
+        bundleIdentifier == "com.apple.share.AirDrop.send"
+    }
+
+    /// 宿主应用（例如 Preview）也会暴露 AirDrop 的系统对话框。
+    static func isSystemSharingDialog(title: String?, subrole: String?) -> Bool {
+        title == "AirDrop" && subrole != kAXStandardWindowSubrole
+    }
+
     private static let dockLayer = Int(CGWindowLevelForKey(.dockWindow))
     private static let movableLayers = Set(0..<Int(CGWindowLevelForKey(.screenSaverWindow))).subtracting([dockLayer])
 
@@ -455,7 +466,7 @@ final class WindowAvoider {
             guard let frame = frameOf(item.win),
                   let z = zones.first(where: { $0.screenFrame.intersects(frame) }),
                   let target = maxRect(dead: all, screen: z.visibleFrame) else { return true }
-            setFrame(item.win, target)
+            setFrame(item.win, target, screen: z.visibleFrame)
             // 动画可能还没完全结束，位置没到就下个 tick 再来
             guard let after = frameOf(item.win) else { return false }
             return abs(after.minX - target.minX) > 2 || abs(after.minY - target.minY) > 2
@@ -499,7 +510,8 @@ final class WindowAvoider {
 
     private func fix(pid: pid_t, zones: [DeadZone]) {
         // 在统一入口过滤，覆盖 CGWindowList 与前台应用两条发现路径。
-        guard !Self.isCaptureHost(NSRunningApplication(processIdentifier: pid)?.bundleIdentifier) else { return }
+        let bundleIdentifier = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
+        guard !Self.isCaptureHost(bundleIdentifier), !Self.isSystemSharingHost(bundleIdentifier) else { return }
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 0.3)   // 卡死的应用最多等 0.3s
         let wins = windowElements(app)
@@ -525,7 +537,7 @@ final class WindowAvoider {
             let S = z.visibleFrame
             if frame.width >= S.width * 0.95 && frame.height >= S.height * 0.9,
                let target = maxRect(dead: all, screen: S) {
-                setFrame(win, target)
+                setFrame(win, target, screen: S)
                 continue
             }
 
@@ -543,12 +555,7 @@ final class WindowAvoider {
                 target = place(frame, dead: all, screen: S)
             }
             guard let target else { continue }
-            if isPopover {
-                var point = target.origin
-                if let value = AXValueCreate(.cgPoint, &point) {
-                    AXUIElementSetAttributeValue(win, kAXPositionAttribute as CFString, value)
-                }
-            } else { setFrame(win, target) }
+            setFrame(win, target, screen: S, resize: !isPopover)
             moves += 1
             let after = frameOf(win) ?? target
             let n = (attempts[key]?.0 == frame ? attempts[key]!.1 : 0) + 1
@@ -583,7 +590,14 @@ final class WindowAvoider {
             let (element, depth) = queue[index]; index += 1
             guard seen.insert(CFHash(element)).inserted else { continue }
             let role = attribute(element, kAXRoleAttribute) as? String
-            if role == kAXWindowRole || role == kAXSheetRole || role == "AXPopover" { result.append(element) }
+            if role == kAXWindowRole || role == kAXSheetRole || role == "AXPopover" {
+                if Self.isSystemSharingDialog(title: attribute(element, kAXTitleAttribute) as? String,
+                                              subrole: attribute(element, kAXSubroleAttribute) as? String) {
+                    // 分享弹窗的远程视图尺寸跟随宿主；弹窗打开期间也不要调整父窗口。
+                    return []
+                }
+                result.append(element)
+            }
             guard depth < 3 else { continue }
             for name in ["AXSheets", kAXChildrenAttribute] {
                 let children = attribute(element, name) as? [AXUIElement] ?? []
@@ -610,16 +624,18 @@ final class WindowAvoider {
         var cands: [CGRect] = []
 
         // 水平方向：与窗口同高度范围内的坏区投影到 x 轴
-        let hb = dead.filter { $0.minY < w.maxY - 1 && $0.maxY > w.minY + 1 }.map { ($0.minX, $0.maxX) }
+        let y = min(max(w.minY, S.minY), max(S.minY, S.maxY - w.height))
+        let hb = dead.filter { $0.minY < y + w.height - 1 && $0.maxY > y + 1 }.map { ($0.minX, $0.maxX) }
         for (a, b) in free(S.minX, S.maxX, hb) {
             let nw = min(w.width, b - a)
-            cands.append(CGRect(x: min(max(w.minX, a), b - nw), y: w.minY, width: nw, height: w.height))
+            cands.append(CGRect(x: min(max(w.minX, a), b - nw), y: y, width: nw, height: w.height))
         }
         // 垂直方向：与窗口同宽度范围内的坏区投影到 y 轴
-        let vb = dead.filter { $0.minX < w.maxX - 1 && $0.maxX > w.minX + 1 }.map { ($0.minY, $0.maxY) }
+        let x = min(max(w.minX, S.minX), max(S.minX, S.maxX - w.width))
+        let vb = dead.filter { $0.minX < x + w.width - 1 && $0.maxX > x + 1 }.map { ($0.minY, $0.maxY) }
         for (a, b) in free(S.minY, S.maxY, vb) {
             let nh = min(w.height, b - a)
-            cands.append(CGRect(x: w.minX, y: min(max(w.minY, a), b - nh), width: w.width, height: nh))
+            cands.append(CGRect(x: x, y: min(max(w.minY, a), b - nh), width: w.width, height: nh))
         }
 
         func cost(_ c: CGRect) -> CGFloat {
@@ -627,7 +643,7 @@ final class WindowAvoider {
         }
         return cands
             .filter { c in keepSize ? c.size == w.size : c.width >= minW && c.height >= minH }
-            .filter { c in !dead.contains { overlaps($0, c) } }
+            .filter { c in S.contains(c) && !dead.contains { overlaps($0, c) } }
             .min { cost($0) < cost($1) }
     }
 
@@ -635,7 +651,7 @@ final class WindowAvoider {
     func place(_ w: CGRect, dead: [CGRect], screen S: CGRect) -> CGRect? {
         if let r = plan(w, dead: dead, screen: S, keepSize: true) { return r }
         guard let m = maxRect(dead: dead, screen: S), m.width >= w.width, m.height >= w.height else { return nil }
-        return CGRect(x: m.midX - w.width / 2, y: m.midY - w.height / 2, width: w.width, height: w.height).integral
+        return CGRect(x: m.midX - w.width / 2, y: m.midY - w.height / 2, width: w.width, height: w.height)
     }
 
     private func isSettable(_ e: AXUIElement, _ a: String) -> Bool {
@@ -652,20 +668,36 @@ final class WindowAvoider {
         var pv: CFTypeRef?, sv: CFTypeRef?
         guard AXUIElementCopyAttributeValue(e, kAXPositionAttribute as CFString, &pv) == .success,
               AXUIElementCopyAttributeValue(e, kAXSizeAttribute as CFString, &sv) == .success,
-              let pv, let sv else { return nil }
+              let pv, let sv,
+              CFGetTypeID(pv) == AXValueGetTypeID(), CFGetTypeID(sv) == AXValueGetTypeID() else { return nil }
         var p = CGPoint.zero, s = CGSize.zero
-        AXValueGetValue(pv as! AXValue, .cgPoint, &p)
-        AXValueGetValue(sv as! AXValue, .cgSize, &s)
+        guard AXValueGetValue(pv as! AXValue, .cgPoint, &p),
+              AXValueGetValue(sv as! AXValue, .cgSize, &s),
+              p.x.isFinite, p.y.isFinite, s.width.isFinite, s.height.isFinite,
+              s.width > 0, s.height > 0 else { return nil }
         return CGRect(origin: p, size: s)
     }
 
-    private func setFrame(_ e: AXUIElement, _ r: CGRect) {
+    /// AX 应用可能拒绝缩小尺寸；用实际尺寸再次约束位置，避免窗口被推出屏幕。
+    static func boundedOrigin(of frame: CGRect, screen: CGRect) -> CGPoint {
+        CGPoint(x: min(max(frame.minX, screen.minX), max(screen.minX, screen.maxX - frame.width)),
+                y: min(max(frame.minY, screen.minY), max(screen.minY, screen.maxY - frame.height)))
+    }
+
+    private func setFrame(_ e: AXUIElement, _ r: CGRect, screen: CGRect, resize: Bool = true) {
+        guard screen.contains(r), let original = frameOf(e) else { return }
         var p = r.origin, s = r.size
         guard let pv = AXValueCreate(.cgPoint, &p), let sv = AXValueCreate(.cgSize, &s) else { return }
-        // 先移后缩再移：有些应用在尺寸改变时会自己调整位置
         AXUIElementSetAttributeValue(e, kAXPositionAttribute as CFString, pv)
-        AXUIElementSetAttributeValue(e, kAXSizeAttribute as CFString, sv)
-        AXUIElementSetAttributeValue(e, kAXPositionAttribute as CFString, pv)
+        if resize && isSettable(e, kAXSizeAttribute) {
+            AXUIElementSetAttributeValue(e, kAXSizeAttribute as CFString, sv)
+        }
+        // 按读回尺寸计算安全位置，不能假定 AXSize 写入一定成功。
+        let actual = frameOf(e) ?? original
+        p = Self.boundedOrigin(of: CGRect(origin: r.origin, size: actual.size), screen: screen)
+        if let safePosition = AXValueCreate(.cgPoint, &p) {
+            AXUIElementSetAttributeValue(e, kAXPositionAttribute as CFString, safePosition)
+        }
     }
 }
 
