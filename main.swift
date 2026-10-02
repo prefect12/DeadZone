@@ -584,23 +584,31 @@ final class WindowAvoider {
                 element = parent as! AXUIElement
             }
         }
-        var seen = Set<CFHashCode>(), result: [AXUIElement] = []
+        return Self.collectWindows(roots: roots, identity: { CFHash($0) },
+                                   attribute: { attribute($0, $1) })
+    }
+
+    /// 遍历与 AX 读取分开：分享弹窗和文档窗口并存时，也必须保留文档窗口。
+    static func collectWindows<Element>(roots: [Element], identity: (Element) -> CFHashCode,
+                                        attribute: (Element, String) -> Any?) -> [Element] {
+        var seen = Set<CFHashCode>(), result: [Element] = []
         var queue = roots.map { ($0, 0) }, index = 0
         while index < queue.count && index < 120 {
             let (element, depth) = queue[index]; index += 1
-            guard seen.insert(CFHash(element)).inserted else { continue }
+            guard seen.insert(identity(element)).inserted else { continue }
             let role = attribute(element, kAXRoleAttribute) as? String
             if role == kAXWindowRole || role == kAXSheetRole || role == "AXPopover" {
                 if Self.isSystemSharingDialog(title: attribute(element, kAXTitleAttribute) as? String,
                                               subrole: attribute(element, kAXSubroleAttribute) as? String) {
-                    // 分享弹窗的远程视图尺寸跟随宿主；弹窗打开期间也不要调整父窗口。
-                    return []
+                    // 只跳过分享弹窗及其远程子视图，继续处理同一应用的文档窗口。
+                    // 不能清空整个列表，否则打开分享后图片窗口会停在坏区里。
+                    continue
                 }
                 result.append(element)
             }
             guard depth < 3 else { continue }
             for name in ["AXSheets", kAXChildrenAttribute] {
-                let children = attribute(element, name) as? [AXUIElement] ?? []
+                let children = attribute(element, name) as? [Element] ?? []
                 queue.append(contentsOf: children.prefix(max(0, 120 - queue.count)).map { ($0, depth + 1) })
             }
         }

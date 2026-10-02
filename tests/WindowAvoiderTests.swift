@@ -31,4 +31,17 @@ precondition(!WindowAvoider.isSystemSharingHost("com.apple.Preview"))
 precondition(WindowAvoider.isSystemSharingDialog(title: "AirDrop", subrole: "AXSystemDialog"))
 precondition(!WindowAvoider.isSystemSharingDialog(title: "AirDrop", subrole: kAXStandardWindowSubrole))
 precondition(!WindowAvoider.isSystemSharingDialog(title: "Save", subrole: "AXDialog"))
+// Exercise the production collector with a document and a sharing proxy in either order.
+// The earlier app-wide return [] loses the document; sharing descendants must stay excluded.
+let nodes: [Int: [String: Any]] = [
+    1: [kAXRoleAttribute: kAXWindowRole, kAXTitleAttribute: "Photo", kAXSubroleAttribute: kAXStandardWindowSubrole],
+    2: [kAXRoleAttribute: kAXWindowRole, kAXTitleAttribute: "AirDrop", kAXSubroleAttribute: "AXSystemDialog", kAXChildrenAttribute: [3]],
+    3: [kAXRoleAttribute: kAXWindowRole, kAXTitleAttribute: "Remote view"],
+    4: [kAXRoleAttribute: kAXWindowRole, kAXTitleAttribute: "AirDrop", kAXSubroleAttribute: kAXStandardWindowSubrole]
+]
+for roots in [[1, 2, 4], [2, 1, 4]] {
+    let selected = WindowAvoider.collectWindows(roots: roots, identity: { CFHashCode($0) },
+                                              attribute: { nodes[$0]?[$1] })
+    precondition(selected == [1, 4], "AirDrop must not suppress the photo window or include remote child windows")
+}
 print("Window avoidance regressions passed")
