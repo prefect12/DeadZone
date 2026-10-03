@@ -45,3 +45,29 @@ for roots in [[1, 2, 4], [2, 1, 4]] {
     precondition(selected == [1, 4], "AirDrop must not suppress the photo window or include remote child windows")
 }
 print("Window avoidance regressions passed")
+
+// Preview exposes unnamed full-screen backing windows alongside the AirDrop root.
+// Moving even one backing window displaces the hosted panel below the display.
+let sharingOverlay = CGRect(x: 0, y: 0, width: 2560, height: 1440)
+let sharingGraph: [Int: [String: Any]] = [
+    1: [kAXRoleAttribute: kAXWindowRole, kAXTitleAttribute: "Photo", kAXSubroleAttribute: kAXStandardWindowSubrole],
+    2: [kAXRoleAttribute: kAXWindowRole, kAXTitleAttribute: "AirDrop", kAXSubroleAttribute: "AXSystemDialog", kAXChildrenAttribute: [3]],
+    3: [kAXRoleAttribute: kAXWindowRole, kAXTitleAttribute: "Remote view"],
+    5: [kAXRoleAttribute: kAXWindowRole, kAXTitleAttribute: "", kAXSubroleAttribute: "AXUnknown"],
+    6: [kAXRoleAttribute: kAXWindowRole, kAXSubroleAttribute: "AXUnknown"],
+    7: [kAXRoleAttribute: kAXWindowRole, kAXTitleAttribute: "", kAXSubroleAttribute: "AXUnknown"],
+    8: [kAXRoleAttribute: kAXWindowRole, kAXTitleAttribute: "", kAXSubroleAttribute: kAXStandardWindowSubrole],
+    9: [kAXRoleAttribute: kAXWindowRole, kAXSubroleAttribute: "AXUnknown"]
+]
+let sharingBounds = [2: sharingOverlay, 5: sharingOverlay, 6: sharingOverlay.offsetBy(dx: 0, dy: 792),
+                     7: sharingOverlay.offsetBy(dx: 0, dy: 794), 8: sharingOverlay,
+                     9: CGRect(x: 0, y: 0, width: 400, height: 300)]
+for roots in [[1, 2, 5, 6, 7, 8, 9, 3], [3, 9, 8, 7, 6, 5, 2, 1]] {
+    let selected = WindowAvoider.collectWindows(roots: roots, identity: { CFHashCode($0) },
+                                              attribute: { sharingGraph[$0]?[$1] }, frame: { sharingBounds[$0] })
+    precondition(Set(selected) == [1, 8, 9], "Sharing backdrops and independently rooted remote descendants must be excluded")
+}
+let withoutSharing = WindowAvoider.collectWindows(roots: [1, 5, 8, 9], identity: { CFHashCode($0) },
+                                                  attribute: { sharingGraph[$0]?[$1] }, frame: { sharingBounds[$0] })
+precondition(withoutSharing == [1, 5, 8, 9], "No app-wide exclusion: ordinary windows remain movable without AirDrop")
+print("AirDrop backing-window regressions passed")

@@ -585,13 +585,17 @@ final class WindowAvoider {
             }
         }
         return Self.collectWindows(roots: roots, identity: { CFHash($0) },
-                                   attribute: { attribute($0, $1) })
+                                   attribute: { attribute($0, $1) }, frame: { frameOf($0) })
     }
 
     /// 遍历与 AX 读取分开：分享弹窗和文档窗口并存时，也必须保留文档窗口。
     static func collectWindows<Element>(roots: [Element], identity: (Element) -> CFHashCode,
-                                        attribute: (Element, String) -> Any?) -> [Element] {
+                                        attribute: (Element, String) -> Any?,
+                                        frame: (Element) -> CGRect? = { _ in nil }) -> [Element] {
         var seen = Set<CFHashCode>(), result: [Element] = []
+        var sharingFrames: [CGRect] = []
+        var sharingNodes = Set<CFHashCode>()
+        var childrenByID: [CFHashCode: [Element]] = [:]
         var queue = roots.map { ($0, 0) }, index = 0
         while index < queue.count && index < 120 {
             let (element, depth) = queue[index]; index += 1
@@ -600,19 +604,41 @@ final class WindowAvoider {
             if role == kAXWindowRole || role == kAXSheetRole || role == "AXPopover" {
                 if Self.isSystemSharingDialog(title: attribute(element, kAXTitleAttribute) as? String,
                                               subrole: attribute(element, kAXSubroleAttribute) as? String) {
-                    // 只跳过分享弹窗及其远程子视图，继续处理同一应用的文档窗口。
-                    // 不能清空整个列表，否则打开分享后图片窗口会停在坏区里。
-                    continue
+                    sharingNodes.insert(identity(element))
+                    if let bounds = frame(element) { sharingFrames.append(bounds) }
+                } else {
+                    result.append(element)
                 }
-                result.append(element)
             }
             guard depth < 3 else { continue }
             for name in ["AXSheets", kAXChildrenAttribute] {
                 let children = attribute(element, name) as? [Element] ?? []
-                queue.append(contentsOf: children.prefix(max(0, 120 - queue.count)).map { ($0, depth + 1) })
+                let admitted = Array(children.prefix(max(0, 120 - queue.count)))
+                childrenByID[identity(element), default: []].append(contentsOf: admitted)
+                queue.append(contentsOf: admitted.map { ($0, depth + 1) })
             }
         }
-        return result
+        // 焦点路径可能把远程子窗口单独加入 roots；按身份排除，不能依赖遍历顺序。
+        var excluded = sharingNodes, pending = Array(sharingNodes)
+        while let id = pending.popLast() {
+            for child in childrenByID[id] ?? [] {
+                let childID = identity(child)
+                if excluded.insert(childID).inserted { pending.append(childID) }
+            }
+        }
+        return result.filter { element in
+            guard !excluded.contains(identity(element)) else { return false }
+            // Preview 的整屏分享层还包含空标题 AXUnknown 背景窗口。
+            // 它们与 AirDrop 代理同尺寸，移动任何一层都会把远程内容推到屏幕外。
+            // 位置可能已经被旧版改过，因此只比较尺寸；普通文档窗口继续避让。
+            let title = attribute(element, kAXTitleAttribute) as? String
+            if (title ?? "").isEmpty,
+               attribute(element, kAXSubroleAttribute) as? String == "AXUnknown",
+               let bounds = frame(element), sharingFrames.contains(where: {
+                   abs($0.width - bounds.width) <= 1 && abs($0.height - bounds.height) <= 1
+               }) { return false }
+            return true
+        }
     }
 
     /// 在 [lo, hi] 中扣掉被占用的区间，返回空闲区间
