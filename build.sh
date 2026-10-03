@@ -5,7 +5,7 @@
 set -e
 cd "$(dirname "$0")"
 
-VERSION="${VERSION:-1.3.1}"
+VERSION="${VERSION:-1.3.3}"
 APP=build/DeadZone.app
 rm -rf build
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
