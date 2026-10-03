@@ -143,7 +143,7 @@ xattr -dr com.apple.quarantine /Applications/DeadZone.app
 ## 开发
 
 ```bash
-./build.sh            # 构建到 build/DeadZone.app（Universal，默认版本 1.3.1）
+./build.sh            # 构建到 build/DeadZone.app（Universal，默认版本 1.3.3）
 ./build.sh --install  # 构建、安装并启动
 swift scripts/make_icon.swift Resources/icon.png   # 重新生成图标 PNG
 swift scripts/make_demo.swift Resources/demo.gif   # 重新生成 README 示意动画
@@ -153,6 +153,7 @@ swift scripts/make_demo.swift Resources/demo.gif   # 重新生成 README 示意�
 
 ```bash
 ./tests/run-achievement-ui.sh  # 成就覆盖、阈值/进度、持久解锁、导出与 3D 几何/暂停
+./tests/run-window-avoider.sh  # AirDrop 分享层、普通文档窗口与屏幕边缘避让
 ```
 
 战绩背景 `Resources/ShareCardBackdrop.png` 使用 ImageGen 按本项目批准的界面方案生成；统计、文字和徽章由代码绘制。
