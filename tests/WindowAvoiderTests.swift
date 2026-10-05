@@ -71,3 +71,35 @@ let withoutSharing = WindowAvoider.collectWindows(roots: [1, 5, 8, 9], identity:
                                                   attribute: { sharingGraph[$0]?[$1] }, frame: { sharingBounds[$0] })
 precondition(withoutSharing == [1, 5, 8, 9], "No app-wide exclusion: ordinary windows remain movable without AirDrop")
 print("AirDrop backing-window regressions passed")
+
+// Hosts may accept a write, then snap their popup back. This must exhaust a
+// single budget, including maximized and pending-fullscreen placement paths.
+let anchor = CGRect(x: 900, y: 100, width: 480, height: 320)
+let displaced = anchor.offsetBy(dx: 0, dy: 400)
+var movement = WindowMoveGuard()
+for t in 0..<3 {
+    precondition(movement.begin(100, frame: anchor, now: Double(t)))
+    movement.finish(100, frame: displaced)
+}
+for t in 3..<100 {
+    let jitter = anchor.offsetBy(dx: CGFloat(t % 3), dy: CGFloat(t % 4))
+    precondition(!movement.begin(100, frame: jitter, now: Double(t)), "Snap-back and jitter must not restart movement")
+    precondition(!movement.begin(100, frame: displaced, now: Double(t)), "Both endpoints share one retry budget")
+}
+let userMoved = anchor.offsetBy(dx: -200, dy: 0)
+precondition(movement.begin(100, frame: userMoved, now: 101), "User repositioning must re-enable avoidance")
+movement.finish(100, frame: displaced)
+precondition(!movement.begin(100, frame: userMoved, now: 101.25), "Wait for host layout before another write")
+// Refused writes consume attempts, and independent windows keep their own budget.
+var refused = WindowMoveGuard()
+for t in 0..<3 {
+    precondition(refused.begin(101, frame: anchor, now: Double(t)))
+    refused.finish(101, frame: anchor)
+}
+precondition(!refused.begin(101, frame: anchor, now: 4))
+precondition(refused.begin(102, frame: anchor, now: 4))
+refused.configure(dead)
+precondition(refused.begin(101, frame: anchor, now: 5), "Changing zones clears stale failures")
+refused.finish(101, frame: nil)
+precondition(!refused.begin(101, frame: anchor, now: 5.25))
+print("Window snap-back and retry-budget regressions passed")
