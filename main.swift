@@ -374,10 +374,57 @@ final class OverlayManager {
 
 // MARK: - 窗口避让（Accessibility API）
 
+/// A host may accept AXPosition and then restore its anchored popup on the next tick.
+/// Remember both ends of each move so an A -> B -> A cycle cannot reset the budget.
+struct WindowMoveGuard {
+    private struct Attempt {
+        var frames: [CGRect] = []
+        var count = 0
+        var lastWrite: TimeInterval = -.infinity
+    }
+    private var attempts: [CFHashCode: Attempt] = [:]
+    private var configuration: [CGRect] = []
+
+    static func sameFrame(_ a: CGRect, _ b: CGRect) -> Bool {
+        abs(a.minX - b.minX) <= 8 && abs(a.minY - b.minY) <= 8
+            && abs(a.width - b.width) <= 8 && abs(a.height - b.height) <= 8
+    }
+
+    mutating func configure(_ rects: [CGRect]) {
+        if configuration != rects { attempts.removeAll(); configuration = rects }
+    }
+
+    mutating func begin(_ key: CFHashCode, frame: CGRect, now: TimeInterval) -> Bool {
+        var attempt = attempts[key] ?? Attempt()
+        // Allow asynchronous host layout to settle before another write.
+        if now - attempt.lastWrite < 0.75 { return false }
+        // A materially new position/size (e.g. a user drag) permits avoidance again.
+        if !attempt.frames.contains(where: { Self.sameFrame($0, frame) }) {
+            attempt = Attempt()
+        }
+        guard attempt.count < 3 else { return false }
+        attempt.count += 1
+        attempt.lastWrite = now
+        if !attempt.frames.contains(where: { Self.sameFrame($0, frame) }) { attempt.frames.append(frame) }
+        if attempts[key] == nil && attempts.count >= 512,
+           let oldest = attempts.min(by: { $0.value.lastWrite < $1.value.lastWrite })?.key {
+            attempts.removeValue(forKey: oldest)
+        }
+        attempts[key] = attempt
+        return true
+    }
+
+    mutating func finish(_ key: CFHashCode, frame: CGRect?) {
+        guard let frame, var attempt = attempts[key] else { return }
+        if !attempt.frames.contains(where: { Self.sameFrame($0, frame) }) { attempt.frames.append(frame) }
+        attempts[key] = attempt
+    }
+}
+
 final class WindowAvoider {
     private let minW: CGFloat = 240, minH: CGFloat = 160
-    /// 记录挪不动的窗口，避免反复拉扯：窗口 hash -> (上次看到的位置, 尝试次数)
-    private var attempts: [CFHashCode: (CGRect, Int)] = [:]
+    private var moveGuard = WindowMoveGuard()
+    private var ownMoveGuard = WindowMoveGuard()
     /// 被推开的窗口次数（成就统计用，主线程读取后清零）
     var moves = 0
     /// 刚被我们退出全屏的窗口，等动画结束后放到"最大可用矩形"
@@ -405,6 +452,8 @@ final class WindowAvoider {
     private static let movableLayers = Set(0..<Int(CGWindowLevelForKey(.screenSaverWindow))).subtracting([dockLayer])
 
     func tick(zones: [DeadZone]) {
+        moveGuard.configure(zones.flatMap { $0.rects })
+        ownMoveGuard.configure(zones.flatMap { $0.rects })
         guard !zones.isEmpty, AXIsProcessTrusted() else { return }
         // 用户正在拖动时不抢，松手后再处理
         if NSEvent.pressedMouseButtons != 0 { return }
@@ -439,15 +488,14 @@ final class WindowAvoider {
             let frame = toCG(w.frame)
             guard let z = hit(frame, zones) else { continue }
             let key = CFHashCode(bitPattern: w.windowNumber)
-            if let (last, n) = attempts[key], last == frame, n >= 3 { continue }
             let S = z.visibleFrame
             let maximized = frame.width >= S.width * 0.95 && frame.height >= S.height * 0.9
             guard let target = (maximized ? nil : plan(frame, dead: all, screen: S)) ?? maxRect(dead: all, screen: S) else { continue }
-            w.setFrame(toNS(target), display: true, animate: true)
-            moves += 1
+            guard ownMoveGuard.begin(key, frame: frame, now: ProcessInfo.processInfo.systemUptime) else { continue }
+            w.setFrame(toNS(target), display: true, animate: false)
             let after = toCG(w.frame)
-            let n = (attempts[key]?.0 == frame ? attempts[key]!.1 : 0) + 1
-            attempts[key] = (after, n)
+            ownMoveGuard.finish(key, frame: after)
+            if !WindowMoveGuard.sameFrame(frame, after) { moves += 1 }
         }
     }
 
@@ -466,7 +514,10 @@ final class WindowAvoider {
             guard let frame = frameOf(item.win),
                   let z = zones.first(where: { $0.screenFrame.intersects(frame) }),
                   let target = maxRect(dead: all, screen: z.visibleFrame) else { return true }
+            let key = CFHash(item.win)
+            guard moveGuard.begin(key, frame: frame, now: ProcessInfo.processInfo.systemUptime) else { return true }
             setFrame(item.win, target, screen: z.visibleFrame)
+            moveGuard.finish(key, frame: frameOf(item.win))
             // 动画可能还没完全结束，位置没到就下个 tick 再来
             guard let after = frameOf(item.win) else { return false }
             return abs(after.minX - target.minX) > 2 || abs(after.minY - target.minY) > 2
@@ -537,12 +588,16 @@ final class WindowAvoider {
             let S = z.visibleFrame
             if frame.width >= S.width * 0.95 && frame.height >= S.height * 0.9,
                let target = maxRect(dead: all, screen: S) {
+                let key = CFHash(win)
+                guard moveGuard.begin(key, frame: frame, now: ProcessInfo.processInfo.systemUptime) else { continue }
                 setFrame(win, target, screen: S)
+                let after = frameOf(win)
+                moveGuard.finish(key, frame: after)
+                if let after, !WindowMoveGuard.sameFrame(frame, after) { moves += 1 }
                 continue
             }
 
             let key = CFHash(win)
-            if let (last, n) = attempts[key], last == frame, n >= 3 { continue }   // 放弃这个倔强的窗口
 
             // 弹窗、对话框一般不能改大小：只挪位置，找一个整块放得下的地方
             let target: CGRect?
@@ -555,13 +610,12 @@ final class WindowAvoider {
                 target = place(frame, dead: all, screen: S)
             }
             guard let target else { continue }
+            guard moveGuard.begin(key, frame: frame, now: ProcessInfo.processInfo.systemUptime) else { continue }
             setFrame(win, target, screen: S, resize: !isPopover)
-            moves += 1
-            let after = frameOf(win) ?? target
-            let n = (attempts[key]?.0 == frame ? attempts[key]!.1 : 0) + 1
-            attempts[key] = (after, n)
+            let after = frameOf(win)
+            moveGuard.finish(key, frame: after)
+            if let after, !WindowMoveGuard.sameFrame(frame, after) { moves += 1 }
         }
-        if attempts.count > 500 { attempts.removeAll() }
     }
 
     /// 分享服务和 sheet 不一定列在 AXWindows；有限遍历附属窗口与焦点祖先。
@@ -723,7 +777,8 @@ final class WindowAvoider {
         var p = r.origin, s = r.size
         guard let pv = AXValueCreate(.cgPoint, &p), let sv = AXValueCreate(.cgSize, &s) else { return }
         AXUIElementSetAttributeValue(e, kAXPositionAttribute as CFString, pv)
-        if resize && isSettable(e, kAXSizeAttribute) {
+        if resize && (abs(original.width - r.width) > 2 || abs(original.height - r.height) > 2)
+            && isSettable(e, kAXSizeAttribute) {
             AXUIElementSetAttributeValue(e, kAXSizeAttribute as CFString, sv)
         }
         // 按读回尺寸计算安全位置，不能假定 AXSize 写入一定成功。
